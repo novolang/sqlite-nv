@@ -1,0 +1,275 @@
+// sqrec.nv — the record format: what a row looks like once it is a
+// run of bytes, and the serial types that say so.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A RECORD IS A HEADER OF TYPES FOLLOWED BY A BODY OF VALUES, and
+// nothing in the body says where a value ends.  The header is a
+// varint giving its own length in bytes, then one varint per column
+// — the SERIAL TYPE — and the length of every value is a function of
+// its serial type alone.  That is the whole format, and it is why a
+// record cannot be decoded backwards, skipped into, or read column
+// four of without reading columns one to three.
+//
+// THE SERIAL TYPE IS BOTH THE TYPE AND THE LENGTH, which is the piece
+// a reader ported from a tagged format gets wrong:
+//
+//   0        NULL, zero bytes
+//   1..6     a big-endian two's-complement integer in 1, 2, 3, 4, 6
+//            and 8 bytes — note there is no 5 or 7-byte width, so the
+//            mapping from code to length is a table and not arithmetic
+//   7        an IEEE-754 binary64, 8 bytes, big-endian
+//   8        the integer 0, zero bytes
+//   9        the integer 1, zero bytes
+//   10, 11   RESERVED.  No file uses them and a file that does is
+//            refused rather than guessed at
+//   N even   a BLOB of (N - 12) / 2 bytes
+//   N odd    TEXT of (N - 13) / 2 bytes, in the DATABASE's encoding
+//
+// Codes 8 and 9 carry their value IN THE TYPE and occupy no bytes at
+// all, which means a column of booleans costs one byte per row for
+// the header and nothing for the data.  A decoder that treated every
+// integer as having a width reads the next column's bytes as this
+// one's, and every column after it is shifted — the failure looks
+// like data corruption and is a table lookup that was written as a
+// subtraction.
+//
+// TEXT IS IN THE DATABASE'S ENCODING AND NOT IN THE COLUMN'S.  There
+// is no per-value encoding byte: `sqfmt.SqTextEncoding` from the file
+// header governs every `SqText` in every record in the file, so
+// `decode_record` takes it as an argument rather than assuming UTF-8.
+//
+// A RECORD MAY BE SHORTER THAN ITS TABLE, and that is not damage.
+// `ALTER TABLE ... ADD COLUMN` does not rewrite the rows already
+// stored: they keep the number of columns they were written with, and
+// a read of a column past the end of a record answers that column's
+// DEFAULT.  A decoder that refused a short record refuses every table
+// anybody has ever added a column to, so `pad_to` is the function
+// that finishes the job and it takes the defaults as an argument.
+
+use sqerror
+use sqfmt
+
+// One column's serial type, decoded from its varint code.
+pub enum SqSerial
+    SqSerNull
+    // A big-endian two's-complement integer this many bytes wide: 1,
+    // 2, 3, 4, 6 or 8.  There is no 5 and no 7.
+    SqSerInt(width: Int)
+    SqSerReal
+    // Serial code 8 — the integer zero, stored in no bytes.
+    SqSerZero
+    // Serial code 9 — the integer one, stored in no bytes.
+    SqSerOne
+    SqSerBlob(length: Int)
+    SqSerText(length: Int)
+
+// A value read out of a record.
+//
+// The five storage classes SQLite has and no sixth: there is no
+// boolean and no date, because the format has neither — a boolean is
+// an integer and a date is whatever the application wrote.
+pub enum SqValue
+    SqNull
+    SqInt(v: Int)
+    SqReal(v: Float)
+    // Already decoded from the file's text encoding into a novo-lang
+    // `Str`, which is UTF-8.  A UTF-16 database's text is converted
+    // once, here, rather than travelling as bytes with an encoding
+    // beside it that a caller has to remember.
+    SqText(v: Str)
+    SqBlob(v: [Int])
+
+// A decoded record: the values, and how far the reader got.
+pub struct SqRecord
+    values: [SqValue]
+    // Bytes the header occupied, the leading length varint included.
+    header_bytes: Int
+    // Bytes the whole record occupied.  A caller walking a page's
+    // cells does not need it — the cell pointer array says where
+    // every cell is — but a caller walking an overflow payload does,
+    // because that is one run of bytes with no index over it.
+    total_bytes: Int
+
+// ── serial types ─────────────────────────────────────────────────────
+
+// The serial type a varint code spells.
+//
+// Refuses 10 and 11: they are reserved for internal use, no file
+// SQLite wrote contains them, and the two plausible guesses about
+// what they would mean disagree about the value's length — so a
+// decoder that guessed shifts every column after it.
+//
+// ```novo
+// use sqrec
+//
+// fn main() [io]
+//     match sqrec.serial_of(9, 4, 12)
+//         Ok(s)  => println("the integer one")
+//         Err(_) => println("reserved")
+// ```
+pub fn serial_of(code: Int, page_no: Int, offset: Int) -> Result<SqSerial, sqerror.SqFault>
+    todo("sqlite-nv.sqrec.serial_of")
+
+// The varint code a serial type is written as.
+pub fn serial_code(s: SqSerial) -> Int
+    todo("sqlite-nv.sqrec.serial_code")
+
+// How many bytes of the record BODY this serial type occupies.
+//
+// Zero for `SqSerNull`, `SqSerZero` and `SqSerOne` — the three that
+// carry their value in the type.  See the module comment for why that
+// is the piece worth having one function for.
+//
+// ```novo
+// use sqrec
+//
+// fn main() [io]
+//     println("${sqrec.serial_bytes(sqrec.SqSerOne)}")
+// ```
+pub fn serial_bytes(s: SqSerial) -> Int
+    todo("sqlite-nv.sqrec.serial_bytes")
+
+// The serial type that stores `v` in the fewest bytes.
+//
+// The writer's half of the table: an integer 0 or 1 becomes
+// `SqSerZero` or `SqSerOne` and costs nothing, and every other
+// integer takes the narrowest of the six widths that holds it.
+pub fn serial_for(v: SqValue) -> SqSerial
+    todo("sqlite-nv.sqrec.serial_for")
+
+// ── decoding ─────────────────────────────────────────────────────────
+
+// Decode one record from `buf` at `offset`.
+//
+// `encoding` is the FILE's, from `sqfmt.SqHeader.text_encoding`, and
+// governs every text value in the record — see the module comment.
+// `page_no` is carried only so a fault can name the page it came
+// from; nothing about the decode depends on it.
+//
+// ```novo
+// use sqrec
+// use sqfmt
+// use std.list
+//
+// fn main() [io]
+//     match sqrec.decode_record([], 0, sqfmt.SqUtf8, 4)
+//         Ok(r)  => println("${list.len(r.values)} values")
+//         Err(_) => println("bad record")
+// ```
+pub fn decode_record(buf: [Int], offset: Int, encoding: sqfmt.SqTextEncoding,
+                     page_no: Int) -> Result<SqRecord, sqerror.SqFault>
+    todo("sqlite-nv.sqrec.decode_record")
+
+// Decode only a record's header — the serial types, and no values.
+//
+// What a schema reader and a column-count check want: the types of a
+// row cost the header alone, and a caller that only needs to know how
+// many columns a row has should not pay for a megabyte BLOB.
+pub fn decode_header(buf: [Int], offset: Int, page_no: Int) -> Result<[SqSerial], sqerror.SqFault>
+    todo("sqlite-nv.sqrec.decode_header")
+
+// Decode ONE column out of a record, by index, reading no further
+// than it has to.
+//
+// The header still has to be read in full — every serial type up to
+// the one wanted decides where its value starts — but the values
+// before it are skipped rather than built, which is the difference
+// between reading a row's rowid and reading its thumbnail.
+//
+// `None` when the record has fewer columns than `index + 1`, which is
+// a short record and not a fault; see the module comment.
+pub fn column_at(buf: [Int], offset: Int, index: Int, encoding: sqfmt.SqTextEncoding,
+                 page_no: Int) -> Result<?SqValue, sqerror.SqFault>
+    todo("sqlite-nv.sqrec.column_at")
+
+// `values` extended to `width` columns with the defaults in
+// `defaults`, for a record written before an `ALTER TABLE ADD COLUMN`.
+//
+// The defaults come from the table definition and not from this
+// package: a record does not say what it is missing.
+//
+// ```novo
+// use sqrec
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(sqrec.pad_to([], 3, [sqrec.SqNull]))}")
+// ```
+pub fn pad_to(values: [SqValue], width: Int, defaults: [SqValue]) -> [SqValue]
+    todo("sqlite-nv.sqrec.pad_to")
+
+// ── encoding ─────────────────────────────────────────────────────────
+
+// Encode a row as a record.
+//
+// The inverse of `decode_record` on every value, so the round trip
+// over a corpus file's rows is a test rather than a claim.
+pub fn encode_record(values: [SqValue],
+                     encoding: sqfmt.SqTextEncoding) -> Result<[Int], sqerror.SqFault>
+    todo("sqlite-nv.sqrec.encode_record")
+
+// How many bytes `encode_record` will produce, without producing
+// them.
+//
+// A cell's total payload decides whether it overflows
+// (`sqfmt.local_payload_bytes`), and that decision has to be made
+// before the bytes are laid out — building the record to measure it
+// is the shape that makes a writer copy every row twice.
+pub fn encoded_size(values: [SqValue], encoding: sqfmt.SqTextEncoding) -> Int
+    todo("sqlite-nv.sqrec.encoded_size")
+
+// ── values ───────────────────────────────────────────────────────────
+
+// The storage class `v` is in, as SQLite's own PRAGMA spells it:
+// "null", "integer", "real", "text" or "blob".
+//
+// ```novo
+// use sqrec
+//
+// fn main() [io]
+//     println(sqrec.type_name(sqrec.SqNull))
+// ```
+pub fn type_name(v: SqValue) -> Str
+    todo("sqlite-nv.sqrec.type_name")
+
+// `v` as an integer, or `None` when it is not one.
+//
+// No coercion: a text value holding "42" answers `None`, because the
+// affinity rules that would convert it are the ENGINE's and belong
+// where the column's declared type is known.  A reader of a file has
+// no column type in hand.
+pub fn as_int(v: SqValue) -> ?Int
+    todo("sqlite-nv.sqrec.as_int")
+
+// `v` as a float, or `None`.
+pub fn as_real(v: SqValue) -> ?Float
+    todo("sqlite-nv.sqrec.as_real")
+
+// `v` as text, or `None`.
+pub fn as_text(v: SqValue) -> ?Str
+    todo("sqlite-nv.sqrec.as_text")
+
+// `v` as bytes, or `None`.
+pub fn as_blob(v: SqValue) -> ?[Int]
+    todo("sqlite-nv.sqrec.as_blob")
+
+// Compare two values in SQLite's storage-class order: NULL first,
+// then numbers, then text, then blobs.
+//
+// Published because it is the order an index is built in, so a caller
+// that seeks an index key has to sort the way the file already did.
+// It is NOT collation-aware: BINARY only, which is what the format
+// stores when nothing says otherwise, and a column declared `COLLATE
+// NOCASE` is a case this reader answers wrong and says so rather than
+// pretending.
+pub fn compare(a: SqValue, b: SqValue) -> Int
+    todo("sqlite-nv.sqrec.compare")
+
+// One line rendering a value, for a report a person reads.
+//
+// Never SQL: a blob comes out as a byte count and not as an X'..'
+// literal, because a function that produced SQL would be one a caller
+// pastes into a query, and this package does not quote anything.
+pub fn show(v: SqValue) -> Str
+    todo("sqlite-nv.sqrec.show")

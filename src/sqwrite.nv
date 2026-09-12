@@ -1,0 +1,264 @@
+// sqwrite.nv — the commit protocol: the rollback journal, the
+// write-ahead log, and the order the three files have to be touched
+// in for a crash at any instant to leave a database and not a
+// question.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS DECLARED SEPARATELY BECAUSE WRITING IS A DIFFERENT
+// PROMISE FROM READING, and a consumer deserves to see which one it
+// is taking.  Reading a SQLite file wrong produces a wrong answer;
+// writing one wrong produces a file that SQLite itself will not open,
+// belonging to somebody who has no other copy.  Everything in this
+// module is therefore scoped out loud, in the README and here, and
+// the first implementation is expected to land long after the reader
+// does.
+//
+// WHAT IS IN SCOPE FOR THE FIRST IMPLEMENTATION
+//
+//   * the ROLLBACK JOURNAL in `delete` and `truncate` modes: copy
+//     every page about to change into `<name>-journal`, fsync it,
+//     change the pages, fsync the database, delete the journal;
+//   * WAL mode: append frames, fsync the log, and put the commit's
+//     page count in the last frame's header rather than writing a
+//     separate commit record;
+//   * a passive checkpoint, bounded by `sqwal.checkpoint_limit`;
+//   * inserting, updating and deleting rows in an existing table,
+//     with the b-tree splits and merges that go with them;
+//   * `CREATE TABLE` and `CREATE INDEX`, which are a schema-table
+//     insert and a fresh root page.
+//
+// WHAT IS OUT OF SCOPE, AND STAYS OUT UNTIL SOMEBODY ASKS
+//
+//   * auto-vacuum and incremental vacuum — the pointer map moves
+//     pages behind the b-tree, and a writer that ignored it corrupts
+//     a file that reads fine;
+//   * shared-cache mode, and any form of multi-process writing beyond
+//     the lock protocol below;
+//   * `ALTER TABLE` beyond `ADD COLUMN`, triggers, views and foreign
+//     key enforcement, all of which are the ENGINE's work rather than
+//     the file's;
+//   * `VACUUM`, which is a rewrite of the whole file and wants its
+//     own design;
+//   * `restart` and `truncate` checkpoints, which need a reader
+//     registry this package does not have.
+//
+// THE ORDER IS THE WHOLE PROTOCOL.  A journal that is written after
+// the page it protects is a journal that protects nothing; an fsync
+// that is skipped between the two is the same bug with a smaller
+// window.  `journal_steps` answers the order as a LIST of steps
+// rather than performing it, so the order is a value a test can
+// assert on — which is the only way to test a crash-safety property
+// without a crash.
+//
+// THE LOCK LADDER IS NOT ADVISORY.  SHARED to write nothing, RESERVED
+// to intend to, PENDING to stop new readers starting, EXCLUSIVE to
+// change a byte.  A writer that took EXCLUSIVE directly deadlocks
+// against every reader instead of waiting for the ones already
+// running, and a writer that skipped PENDING waits forever under a
+// steady stream of them.  `next_lock` is the ladder as a function.
+
+use sqerror
+use sqfile
+use sqrec
+use sqwal
+
+// How a transaction is made durable.
+pub enum SqJournalMode
+    // `<name>-journal` holds the pages as they were; a crash rolls
+    // back by copying them home.  Deleted at commit.
+    SqDeleteJournal
+    // The same, with the journal truncated to zero rather than
+    // deleted — one fewer directory operation, which on some
+    // filesystems is the difference between an fsync of a file and an
+    // fsync of a directory.
+    SqTruncateJournal
+    // The same, with the journal's header zeroed rather than
+    // truncated.  Cheapest, and leaves a file behind.
+    SqPersistJournal
+    // No journal on disk at all.  A crash mid-transaction leaves a
+    // corrupt database, and the mode exists for a database that can
+    // be rebuilt.
+    SqMemoryJournal
+    // Changes are appended to `<name>-wal` and copied back at a
+    // checkpoint.  Readers do not block the writer and the writer
+    // does not block readers, which is why it is the mode anything
+    // concurrent wants.
+    SqWalJournal
+    // No journal and no rollback.  A crash leaves whatever it leaves.
+    SqOffJournal
+
+// One step of a commit, in the order it has to happen.
+//
+// Answered as a value rather than performed — see the module comment.
+pub enum SqCommitStep
+    // Take this lock before going further.
+    SqTakeLock(level: sqfile.SqLockLevel)
+    // Copy this page, as it is now, into the journal.
+    SqJournalPage(page_no: Int)
+    // Flush the journal to the platter.
+    SqSyncJournal
+    // Write this page's new content into the database.
+    SqWritePage(page_no: Int)
+    // Append this page to the log as frame content.
+    SqAppendFrame(page_no: Int, commits: Bool)
+    // Flush the log.
+    SqSyncWal
+    // Flush the database.
+    SqSyncDatabase
+    // Remove, truncate or zero the journal, by the mode.
+    SqFinishJournal
+    // Release every lock.
+    SqReleaseLocks
+
+// A transaction in flight.
+pub struct SqTxn
+    file: sqfile.SqDatabaseFile
+    mode: SqJournalMode
+    // The pages changed so far, and their new content.  Held in
+    // memory until commit, which is what bounds a transaction's size
+    // by the process's memory and is stated rather than discovered.
+    dirty_pages: [Int]
+    dirty_bytes: [[Int]]
+    // Pages already copied into the journal.  A page is journalled
+    // once per transaction however many times it changes.
+    journalled: [Int]
+    // The page count the database will have at commit.
+    page_count_after: Int
+    // The lock this transaction currently holds.
+    held: sqfile.SqLockLevel
+
+// ── the protocol as a value ──────────────────────────────────────────
+
+// The steps a commit of this transaction has to take, in order.
+//
+// The function the module comment exists for: crash safety is an
+// ORDER, and an order that is only ever executed is one no test can
+// look at.  A test builds a transaction, asks for the steps, and
+// asserts that the journal is synced before the first page is
+// written — which is the property, stated as an assertion, with no
+// crash in it.
+//
+// ```novo
+// use sqwrite
+// use std.list
+//
+// fn main() [io]
+//     println("${list.len(sqwrite.commit_steps(sqwrite.SqDeleteJournal, [], 0))}")
+// ```
+pub fn commit_steps(mode: SqJournalMode, dirty: [Int], page_count_after: Int) -> [SqCommitStep]
+    todo("sqlite-nv.sqwrite.commit_steps")
+
+// The steps a rollback has to take, in order.
+pub fn rollback_steps(mode: SqJournalMode, journalled: [Int]) -> [SqCommitStep]
+    todo("sqlite-nv.sqwrite.rollback_steps")
+
+// The next lock a writer holding `held` should take on its way to
+// writing, or `None` when it already holds enough.
+//
+// The ladder as a function — see the module comment.
+//
+// ```novo
+// use sqwrite
+// use sqfile
+//
+// fn main() [io]
+//     match sqwrite.next_lock(sqfile.SqShared, sqwrite.SqDeleteJournal)
+//         Some(l) => println("climb")
+//         None    => println("ready")
+// ```
+pub fn next_lock(held: sqfile.SqLockLevel, mode: SqJournalMode) -> ?sqfile.SqLockLevel
+    todo("sqlite-nv.sqwrite.next_lock")
+
+// The journal file's name for a database path — `<path>-journal` —
+// and the log's, `<path>-wal`.
+//
+// Published because a tool that cleans up after a crashed process has
+// to know both, and because a caller copying a database has to copy
+// all three or none.
+pub fn journal_path(db_path: Str) -> Str
+    todo("sqlite-nv.sqwrite.journal_path")
+
+// The log's path for a database path.
+pub fn wal_path(db_path: Str) -> Str
+    todo("sqlite-nv.sqwrite.wal_path")
+
+// ── running it ───────────────────────────────────────────────────────
+
+// Begin a transaction.
+//
+// Takes the locks the mode needs and no more: a WAL writer takes the
+// log's write lock and never excludes a reader, and a journal writer
+// climbs to RESERVED and stops there until it has a page to write.
+//
+// ```novo
+// use sqwrite
+// use sqfile
+//
+// fn main() [io, fs]
+//     match sqfile.open("/tmp/app.db")
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match sqwrite.begin(db, sqwrite.SqWalJournal)
+//                 Ok(t)  => println("began")
+//                 Err(_) => println("busy")
+// ```
+pub fn begin(db: sqfile.SqDatabaseFile, mode: SqJournalMode) -> Result<SqTxn, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqwrite.begin")
+
+// Stage a page's new content in the transaction.
+//
+// Nothing reaches the disk here: the page joins `dirty_pages`, and
+// the journal copy is taken at commit, in the order `commit_steps`
+// says.
+pub fn stage_page(t: SqTxn, page_no: Int, bytes: [Int]) -> Result<SqTxn, sqerror.SqFault>
+    todo("sqlite-nv.sqwrite.stage_page")
+
+// Run the commit, in the order `commit_steps` answered.
+//
+// Answers the file with its header's change counter and page count
+// moved, so a caller holding the old value can see that it has.
+pub fn commit(t: SqTxn) -> Result<sqfile.SqDatabaseFile, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqwrite.commit")
+
+// Undo the transaction and release its locks.
+pub fn rollback(t: SqTxn) -> Result<sqfile.SqDatabaseFile, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqwrite.rollback")
+
+// Recover a database whose last writer did not finish: roll a
+// leftover journal back, or scan a log and stop where it ends.
+//
+// Called by `sqfile.open` and published because a tool that wants to
+// recover without opening — to report on what it would do first — is
+// a real thing to want.
+pub fn recover(db: sqfile.SqDatabaseFile) -> Result<sqfile.SqDatabaseFile, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqwrite.recover")
+
+// Copy frames from the log back into the database, up to
+// `sqwal.checkpoint_limit`.
+//
+// Answers how many frames were copied, which is what a caller
+// deciding whether to try again wants.
+pub fn checkpoint(db: sqfile.SqDatabaseFile,
+                  mode: sqwal.SqCheckpointMode) -> Result<Int, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqwrite.checkpoint")
+
+// ── rows ─────────────────────────────────────────────────────────────
+
+// Insert a row into a table, answering the rowid it got.
+//
+// A `None` rowid asks for the next one, which is one past the largest
+// in the table — SQLite's rule, and NOT "one past the row count",
+// which differs the moment anything is deleted.
+pub fn insert_row(t: SqTxn, table_root: Int, rowid: ?Int,
+                  values: [sqrec.SqValue]) -> Result<SqTxn, sqerror.SqFault>
+    todo("sqlite-nv.sqwrite.insert_row")
+
+// Replace the row at `rowid`.
+pub fn update_row(t: SqTxn, table_root: Int, rowid: Int,
+                  values: [sqrec.SqValue]) -> Result<SqTxn, sqerror.SqFault>
+    todo("sqlite-nv.sqwrite.update_row")
+
+// Remove the row at `rowid`.
+pub fn delete_row(t: SqTxn, table_root: Int, rowid: Int) -> Result<SqTxn, sqerror.SqFault>
+    todo("sqlite-nv.sqwrite.delete_row")

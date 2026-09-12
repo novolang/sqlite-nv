@@ -1,0 +1,275 @@
+// sqfile.nv — the half that touches the machine: a file descriptor, a
+// positional read, the four lock bytes, and the loop that answers what
+// a cursor asks for.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS IS THE ONLY MODULE IN THE PACKAGE THAT PERFORMS ANYTHING.
+// `sqfmt`, `sqrec`, `sqbtree`, `sqwal` and `sqschema` are `[]`
+// throughout; everything they need arrives as bytes and everything
+// they want arrives as an `SqPageRequest` that this module answers.
+// The manifest says the same thing from the other side.
+//
+// `[fs]` AND NOT `[fs, io]`.  A database is a file: `std.fs` opens
+// it, reads at an offset, locks a byte range and fsyncs, and every one
+// of those is `[fs]` alone.  Nothing here prints, and a caller that
+// wants a report gets text back — `docs/publishing.md` § Design's
+// convention, and the reason a library's `[io]` row is worth not
+// having.
+//
+// A PAGE IS READ AT AN OFFSET, NOT BY SEEKING.  `fs.read_at` takes the
+// offset, so two cursors over one file cannot move a shared position
+// under each other, and a page read needs no lock between reads.  That
+// is what makes `SqCursor`'s value semantics worth anything: the
+// cursors do not alias and neither do their reads.
+//
+// THE WAL IS CONSULTED FIRST ON EVERY READ.  In WAL mode the newest
+// version of a page is in the log, not in the database file, so
+// `read_page` asks `sqwal.frame_for` before it computes a file
+// offset.  A reader that skipped it answers rows as of the last
+// checkpoint — which is not an error anywhere and is simply an old
+// answer, which is the worst kind of wrong to ship.
+//
+// THE LOCK BYTES ARE AT A FIXED ADDRESS AND OUTSIDE THE DATABASE.
+// SQLite locks byte ranges at 0x40000000 and just past it — the
+// PENDING byte, the RESERVED byte, and a 510-byte SHARED range — so
+// that a whole-file lock is never needed and readers do not exclude
+// each other.  The page containing those bytes holds no data, which
+// is why `sqfmt.lock_byte_page` exists and why a reader that treated
+// it as a b-tree node produces rows out of a lock.  Only databases
+// past a gigabyte have one, so a reader that forgot is correct on
+// every fixture anybody writes.
+//
+// A SNAPSHOT IS THE CHANGE COUNTER PLUS THE WAL INDEX.  Nothing here
+// keeps a page cache — a cache whose invalidation rule is wrong is
+// worse than no cache — and `is_stale` is the one question a caller
+// with its own cache asks.
+
+use sqerror
+use sqfmt
+use sqbtree
+use sqrec
+use sqschema
+use sqwal
+
+// An open database.
+//
+// A value: `read_page` does not change it, and `close` consumes it.
+// A caller that wants two independent readers opens the file twice,
+// which costs a file descriptor and buys not having to say what two
+// cursors sharing a handle mean.
+pub struct SqDatabaseFile
+    path: Str
+    // The descriptor `std.fs` handed back.
+    fd: Int
+    // The header, read once at open.
+    header: sqfmt.SqHeader
+    // `sqfmt.usable_size(header)`, carried because every offset check
+    // in every module takes it.
+    usable: Int
+    // The page count the file's LENGTH says, which is what is
+    // believed when the header's `version_valid_for` does not match
+    // its change counter.
+    page_count: Int
+    // The log's descriptor and index, when the database is in WAL
+    // mode; `wal_fd` is 0 when it is not.
+    wal_fd: Int
+    wal: ?sqwal.SqWalIndex
+    // True when the file was opened without write access.
+    read_only: Bool
+
+// What a database's schema turned out to be.
+pub struct SqCatalogue
+    tables: [sqschema.SqTableDef]
+    indexes: [sqschema.SqIndexDef]
+    // The schema cookie the catalogue was read at.  A caller that
+    // caches it compares this with the header's on every open
+    // transaction; a plan outliving its schema is how a query
+    // silently reads the wrong column.
+    cookie: Int
+
+// A cursor pumped to its next answer, and the file it was pumped
+// against.
+pub struct SqPumped
+    file: SqDatabaseFile
+    cursor: sqbtree.SqCursor
+    step: sqbtree.SqStep
+
+// ── opening ──────────────────────────────────────────────────────────
+
+// Open a database for reading and writing.
+//
+// Reads and checks the header, finds `<path>-wal` and scans it when
+// the header says WAL mode, and refuses a file whose header names a
+// feature this port does not read — `SqUnsupported`, carrying the
+// feature's name, so the message says "this reader does not do
+// auto-vacuum yet" rather than "your database is damaged".
+//
+// ```novo
+// use sqfile
+//
+// fn main() [io, fs]
+//     match sqfile.open("/tmp/app.db")
+//         Ok(db) => println("${db.usable}")
+//         Err(f) => println("could not open")
+// ```
+pub fn open(path: Str) -> Result<SqDatabaseFile, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqfile.open")
+
+// Open a database for reading only.
+//
+// The mode this package is FOR: reading a file somebody else owns —
+// a backup, a browser profile, a firmware dump — without being able
+// to change it by accident.  Takes only the SHARED lock, never
+// RESERVED, and every write path refuses with `SqReadOnly`.
+pub fn open_read_only(path: Str) -> Result<SqDatabaseFile, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqfile.open_read_only")
+
+// Close the file, and the log with it.
+//
+// Releases every lock first.  A close that left a lock behind is a
+// database no other process can write until this one exits, which is
+// the bug that gets reported as "the file is locked" days later.
+pub fn close(db: SqDatabaseFile) -> ?sqerror.SqFault [fs]
+    todo("sqlite-nv.sqfile.close")
+
+// The header, as read at open.
+pub fn header(db: SqDatabaseFile) -> sqfmt.SqHeader
+    todo("sqlite-nv.sqfile.header")
+
+// True when the file has changed since this handle read its header —
+// the change counter has moved, or the log has grown.
+//
+// The one question a caller with its own page cache has to ask.
+pub fn is_stale(db: SqDatabaseFile) -> Result<Bool, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqfile.is_stale")
+
+// ── reading ──────────────────────────────────────────────────────────
+
+// Read one page: from the log when the log has a newer version of it,
+// from the database file otherwise.
+//
+// Refuses a page number outside `1..page_count` with `SqNoSuchPage`,
+// which is the check the whole request-and-answer shape exists to put
+// in one place — see `sqbtree`'s module comment.
+//
+// ```novo
+// use sqfile
+//
+// fn main() [io, fs]
+//     match sqfile.open_read_only("/tmp/app.db")
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match sqfile.read_page(db, 1)
+//                 Ok(p)  => println("read")
+//                 Err(_) => println("could not read")
+// ```
+pub fn read_page(db: SqDatabaseFile, page_no: Int) -> Result<[Int], sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqfile.read_page")
+
+// Advance a cursor until it produces a row, an entry, an end or a
+// failure — answering every page it asks for on the way.
+//
+// THE LOOP THE WHOLE PACKAGE IS SHAPED AROUND, written once here so
+// no caller writes it again.  A caller that wants to answer requests
+// itself — from a memory image, from a mapped region, from a network
+// block store — calls `sqbtree.step` and `sqbtree.feed_page` directly
+// and never uses this function; that is the point of the requests
+// being public.
+//
+// ```novo
+// use sqfile
+// use sqbtree
+// use sqfmt
+//
+// fn main() [io, fs]
+//     match sqfile.open_read_only("/tmp/app.db")
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             let c = sqbtree.scan_table(2, db.usable, sqfmt.SqUtf8)
+//             match sqfile.pump(db, c)
+//                 Ok(p)  => println("stepped")
+//                 Err(_) => println("failed")
+// ```
+pub fn pump(db: SqDatabaseFile, c: sqbtree.SqCursor) -> Result<SqPumped, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqfile.pump")
+
+// Read the whole schema table and turn it into a catalogue.
+//
+// Chooses the cursor by `sqschema.is_without_rowid` for every table
+// it finds, which is the decision a reader gets wrong once and then
+// gets wrong for every `WITHOUT ROWID` table forever.
+pub fn catalogue(db: SqDatabaseFile) -> Result<SqCatalogue, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqfile.catalogue")
+
+// Every row of one table, by name.
+//
+// The convenience over `pump`, and the function most first uses of
+// this package will be.  Rows come back as records padded to the
+// table's width, with the rowid substituted into the
+// `INTEGER PRIMARY KEY` column when the table has one — the two
+// corrections `sqschema`'s module comment names, applied here so a
+// caller cannot skip them.
+pub fn rows_of(db: SqDatabaseFile, cat: SqCatalogue,
+               table: Str) -> Result<[[sqrec.SqValue]], sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqfile.rows_of")
+
+// ── locking ──────────────────────────────────────────────────────────
+
+// Which of SQLite's locks a handle holds.
+pub enum SqLockLevel
+    // No lock: the file may be changed under this handle at any time.
+    SqUnlocked
+    // A read lock.  Several readers hold it at once; a writer may
+    // prepare but not commit while one is held.
+    SqShared
+    // "I intend to write."  One at a time, and readers are unaffected.
+    SqReserved
+    // "I am about to write and no new reader may start."  The step
+    // between reserved and exclusive, and the reason the PENDING byte
+    // exists: without it a stream of readers starves a writer forever.
+    SqPending
+    // The write lock.  No reader, no other writer.
+    SqExclusive
+
+// Take a lock, or say who has it.
+//
+// The ranges are at fixed byte addresses past the end of any
+// reasonable database — see the module comment — and `std.fs`'s
+// range locks are what implements them, so two novo-lang processes
+// and a C SQLite hold the same locks against each other.
+//
+// ```novo
+// use sqfile
+//
+// fn main() [io, fs]
+//     match sqfile.open_read_only("/tmp/app.db")
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match sqfile.lock(db, sqfile.SqShared)
+//                 None    => println("locked")
+//                 Some(f) => println("busy")
+// ```
+pub fn lock(db: SqDatabaseFile, level: SqLockLevel) -> ?sqerror.SqFault [fs]
+    todo("sqlite-nv.sqfile.lock")
+
+// Drop every lock this handle holds.
+pub fn unlock(db: SqDatabaseFile) -> ?sqerror.SqFault [fs]
+    todo("sqlite-nv.sqfile.unlock")
+
+// What this handle currently holds.
+pub fn lock_level(db: SqDatabaseFile) -> SqLockLevel
+    todo("sqlite-nv.sqfile.lock_level")
+
+// ── the log ──────────────────────────────────────────────────────────
+
+// Scan `<path>-wal` and build the index of which frame holds which
+// page.
+//
+// Stops at the first frame that `sqwal.ends_log` calls an ending —
+// a torn tail or a stale salt — and keeps everything committed before
+// it.  Called by `open`; published because a tool that wants to
+// report on a log without opening the database it belongs to is a
+// real thing to want.
+pub fn scan_wal(db: SqDatabaseFile) -> Result<sqwal.SqWalIndex, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqfile.scan_wal")

@@ -1,0 +1,494 @@
+// sqfmt.nv — the bytes at the front of a SQLite database, the header
+// at the front of every b-tree page, and the arithmetic that decides
+// where everything else in the file is.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOTHING HERE PERFORMS ANYTHING.  Every function takes bytes the
+// caller already holds.  The module is in a `host` package because
+// `sqfile` is, and the format and the file that carries it are one
+// subject; the rows are `[]` and the manifest says what that means.
+//
+// THE DATABASE HEADER — the first 100 bytes of page 1
+//
+//   0..15    the magic, "SQLite format 3" and a NUL
+//   16..17   page size, big-endian u16; the value 1 means 65536
+//   18       write format: 1 rollback journal, 2 write-ahead log
+//   19       read format: same two values
+//   20       reserved bytes at the END of every page
+//   21       max embedded payload fraction, always 64
+//   22       min embedded payload fraction, always 32
+//   23       leaf payload fraction, always 32
+//   24..27   file change counter
+//   28..31   the database size in pages — valid only when it equals
+//            the change counter's companion at 92..95
+//   32..35   first freelist trunk page, 0 for none
+//   36..39   freelist page count
+//   40..43   schema cookie
+//   44..47   schema format, 1..4
+//   48..51   default page cache size
+//   52..55   largest root b-tree page, non-zero only under vacuum
+//   56..59   text encoding: 1 UTF-8, 2 UTF-16le, 3 UTF-16be
+//   60..63   user version
+//   64..67   incremental-vacuum mode
+//   68..71   application id
+//   72..91   reserved, and must be zero
+//   92..95   version-valid-for
+//   96..99   the SQLITE_VERSION_NUMBER that last wrote it
+//
+// THE USABLE SIZE IS THE NUMBER EVERY OTHER NUMBER IS COMPUTED FROM,
+// and it is `page_size - reserved`, not `page_size`.  Byte 20 is zero
+// in almost every file anybody has, which is exactly why a reader
+// that used the page size instead is correct on every file it is
+// tested against and wrong on the first encrypted or checksummed one
+// it meets — and wrong QUIETLY, by a handful of bytes at the end of a
+// payload.  `usable_size` is public and every offset check in this
+// package takes it as an argument rather than deriving it again.
+//
+// A B-TREE PAGE HEADER — 8 bytes on a leaf, 12 on an interior page
+//
+//   0        the page kind: 2, 5, 10 or 13 and nothing else
+//   1..2     first freeblock in the content area, 0 for none
+//   3..4     the number of cells
+//   5..6     the start of the cell content area; 0 means 65536
+//   7        fragmented free bytes
+//   8..11    the right-most child pointer — INTERIOR PAGES ONLY
+//
+// then the cell pointer array: `cell_count` big-endian u16 offsets,
+// in KEY order rather than in the order the cells sit on the page.
+//
+// PAGE 1 CARRIES BOTH.  Its b-tree page header begins at byte 100,
+// and its cell offsets are still measured from the START of the page.
+// That off-by-100 is the second commonest reading mistake in the
+// format and `page_header_offset` exists so it is written once.
+//
+// THE VARINT IS NOT PROTOBUF'S, and this package does not take
+// varint-nv for it.  SQLite's is BIG-endian, one to nine bytes, and
+// its ninth byte contributes all eight of its bits rather than seven
+// — a shape protobuf's little-endian LEB128 has no spelling for.  Two
+// decoders under one name would be worse than two names.
+
+use sqerror
+
+// The sixteen bytes every SQLite database begins with, as byte
+// values: "SQLite format 3" and a NUL.
+//
+// ```novo
+// use std.list
+// use sqfmt
+//
+// fn main() [io]
+//     println("${list.len(sqfmt.magic())}")
+// ```
+pub fn magic() -> [Int]
+    todo("sqlite-nv.sqfmt.magic")
+
+// 100 — the database header's size in bytes.
+pub fn header_size() -> Int
+    todo("sqlite-nv.sqfmt.header_size")
+
+// How a database file stores text.
+//
+// It is a property of the FILE and not of a column: every `SqSerText`
+// in every record is in this encoding, and a reader that assumed
+// UTF-8 answers mojibake on a UTF-16 database rather than an error.
+pub enum SqTextEncoding
+    SqUtf8
+    SqUtf16Le
+    SqUtf16Be
+
+// Which of the four b-tree pages this is.
+//
+// The numbers are the format's own: a reader may not renumber them,
+// and byte 0 holding anything else is `SqBadPageKind`.
+pub enum SqPageKind
+    // 2 — an interior index page: child pointers and index keys.
+    SqInteriorIndex
+    // 5 — an interior table page: child pointers and rowids.
+    SqInteriorTable
+    // 10 — a leaf index page: index keys, and the rowid inside them.
+    SqLeafIndex
+    // 13 — a leaf table page: rowids and records.  Where every row of
+    // every ordinary table lives.
+    SqLeafTable
+
+// The 100-byte database header, decoded.
+pub struct SqHeader
+    // 512..65536, a power of two.  The on-disk field spells 65536 as
+    // the value 1, and `decode_header` has already undone that.
+    page_size: Int
+    // 1 rollback journal, 2 write-ahead log.
+    write_format: Int
+    read_format: Int
+    // Bytes at the END of every page that the b-tree does not use.
+    // Zero in almost every file; see the module comment for why the
+    // exceptions are the ones that matter.
+    reserved_bytes: Int
+    // Incremented on every change to the file.  A reader that cached
+    // pages compares it and drops the cache.
+    change_counter: Int
+    // The database size in pages, and trustworthy only when
+    // `version_valid_for` equals `change_counter`.  When it does not,
+    // the size is the file's length divided by the page size, which is
+    // what `sqfile` falls back to.
+    page_count: Int
+    // First page of the freelist trunk chain, 0 for an empty list.
+    freelist_trunk: Int
+    freelist_count: Int
+    // Incremented on every DDL statement.  A prepared statement holds
+    // the value it was planned against; a plan outliving its schema is
+    // how a query silently reads the wrong column.
+    schema_cookie: Int
+    // 1..4.  4 is what `DESC` indexes and boolean literals need.
+    schema_format: Int
+    default_cache_size: Int
+    // Non-zero only in an auto-vacuum or incremental-vacuum database,
+    // and this port refuses those rather than reading the pointer map
+    // wrong — see `has_pointer_map`.
+    largest_root_page: Int
+    text_encoding: SqTextEncoding
+    user_version: Int
+    incremental_vacuum: Int
+    application_id: Int
+    // Equals `change_counter` when `page_count` can be believed.
+    version_valid_for: Int
+    // The SQLITE_VERSION_NUMBER of whatever last wrote the file.
+    // Carried because a bug report about a file is a bug report about
+    // the writer, and this is the only place the writer is named.
+    sqlite_version: Int
+
+// A b-tree page's own header, decoded.
+pub struct SqPageHeader
+    kind: SqPageKind
+    // Offset of the first freeblock in the content area, 0 for none.
+    first_freeblock: Int
+    cell_count: Int
+    // Where the cell content area starts.  The on-disk field spells
+    // 65536 as 0 and `decode_page_header` has already undone that.
+    content_start: Int
+    fragmented_free: Int
+    // The right-most child, on an interior page only; 0 on a leaf.
+    right_most: Int
+
+// ── the database header ──────────────────────────────────────────────
+
+// Decode the 100-byte database header from the front of page 1.
+//
+// Refuses in this order, which is the order the checks can be
+// believed in: the magic first, because nothing else in the file
+// means anything until it holds; then the page size, because every
+// later offset is computed from it; then the fields with closed
+// ranges.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     match sqfmt.decode_header([])
+//         Ok(h)  => println("${h.page_size}")
+//         Err(f) => println("not a database")
+// ```
+pub fn decode_header(page_one: [Int]) -> Result<SqHeader, sqerror.SqFault>
+    todo("sqlite-nv.sqfmt.decode_header")
+
+// Encode a header back to its 100 bytes.
+//
+// The inverse of `decode_header` on every field, which is what makes
+// the round trip a test rather than a claim: a corpus file's first
+// hundred bytes decode and re-encode to themselves or the port is
+// wrong somewhere a reader would not notice.
+pub fn encode_header(h: SqHeader) -> [Int]
+    todo("sqlite-nv.sqfmt.encode_header")
+
+// A header for a fresh, empty database with this page size.
+pub fn new_header(page_size: Int) -> Result<SqHeader, sqerror.SqFault>
+    todo("sqlite-nv.sqfmt.new_header")
+
+// `page_size - reserved_bytes` — THE number, and the one this package
+// passes around rather than recomputing.
+//
+// Every offset check, every overflow threshold and every count of
+// pointers on a page is against this and not against the page size.
+// See the module comment.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     match sqfmt.new_header(4096)
+//         Ok(h)  => println("${sqfmt.usable_size(h)}")
+//         Err(_) => println("bad page size")
+// ```
+pub fn usable_size(h: SqHeader) -> Int
+    todo("sqlite-nv.sqfmt.usable_size")
+
+// True when `n` is a legal page size: a power of two, 512..65536.
+pub fn is_legal_page_size(n: Int) -> Bool
+    todo("sqlite-nv.sqfmt.is_legal_page_size")
+
+// `h` with its reserved region set to `n` bytes.
+//
+// The one field a test has to be able to move: byte 20 is zero in
+// almost every file, so the case where the usable size and the page
+// size differ has to be built rather than found.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     match sqfmt.new_header(4096)
+//         Err(_) => println("no")
+//         Ok(h)  => println("${sqfmt.usable_size(sqfmt.with_reserved(h, 16))}")
+// ```
+pub fn with_reserved(h: SqHeader, n: Int) -> SqHeader
+    todo("sqlite-nv.sqfmt.with_reserved")
+
+// The byte offset page `n` begins at.  Pages are numbered from 1.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     println("${sqfmt.page_offset(4096, 2)}")
+// ```
+pub fn page_offset(page_size: Int, page_no: Int) -> Int
+    todo("sqlite-nv.sqfmt.page_offset")
+
+// Where page `n`'s b-tree header starts INSIDE the page: 100 on page
+// 1, which carries the database header first, and 0 everywhere else.
+//
+// The off-by-100 the module comment names, written once.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     println("${sqfmt.page_header_offset(1)} ${sqfmt.page_header_offset(2)}")
+// ```
+pub fn page_header_offset(page_no: Int) -> Int
+    todo("sqlite-nv.sqfmt.page_header_offset")
+
+// True when the file's header says it uses a pointer map — auto-vacuum
+// or incremental-vacuum.
+//
+// Published as a question rather than handled, because this port
+// refuses such a file with `SqUnsupported("auto-vacuum")` and a
+// caller deserves to ask before it opens rather than after.  A
+// pointer map moves pages behind the b-tree, and a reader that
+// ignored it reads a page that has been relocated.
+pub fn has_pointer_map(h: SqHeader) -> Bool
+    todo("sqlite-nv.sqfmt.has_pointer_map")
+
+// The page a pointer-map entry for `page_no` lives on, in a database
+// that has one: page 2, then every `usable/5 + 1` pages.
+//
+// Declared so `sqbtree` can refuse to treat such a page as a b-tree
+// node even while the format is unsupported, because mistaking one
+// for a node is how a reader produces rows out of a bitmap.
+pub fn pointer_map_page(usable: Int, page_no: Int) -> Int
+    todo("sqlite-nv.sqfmt.pointer_map_page")
+
+// The page number of the LOCK-BYTE page, or 0 when the file is too
+// small to have one.
+//
+// A file has a page covering byte 0x40000000 and that page holds no
+// data at all — it is where the locking bytes live, and it is not a
+// b-tree node whatever byte 0 says. Only databases past a gigabyte
+// have one, which is why a reader that forgot is correct on every
+// test fixture ever written.
+pub fn lock_byte_page(page_size: Int) -> Int
+    todo("sqlite-nv.sqfmt.lock_byte_page")
+
+// 0x40000000 — the byte the lock-byte page covers, and the first of
+// the four ranges `sqfile` locks.
+pub fn pending_byte() -> Int
+    todo("sqlite-nv.sqfmt.pending_byte")
+
+// ── a page's own header ──────────────────────────────────────────────
+
+// Decode the b-tree header of page `page_no` from the page's bytes.
+//
+// `usable` is what `usable_size` answered; the header's own fields
+// are checked against it, so a content-area start past the usable end
+// is `SqOffsetOutOfPage` here rather than a wild read later.
+pub fn decode_page_header(page: [Int], page_no: Int,
+                          usable: Int) -> Result<SqPageHeader, sqerror.SqFault>
+    todo("sqlite-nv.sqfmt.decode_page_header")
+
+// Encode a page header into the front of a page buffer.
+pub fn encode_page_header(page: [Int], page_no: Int, h: SqPageHeader) -> [Int]
+    todo("sqlite-nv.sqfmt.encode_page_header")
+
+// 8 for a leaf, 12 for an interior page — the right-most pointer is
+// the difference.
+pub fn page_header_bytes(k: SqPageKind) -> Int
+    todo("sqlite-nv.sqfmt.page_header_bytes")
+
+// A page header with no freeblocks and no fragments — what a freshly
+// written page has, and what a test builds to ask a question about
+// the cell pointer array.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     println("${sqfmt.page_header(sqfmt.SqLeafTable, 3, 4000, 0).cell_count}")
+// ```
+pub fn page_header(k: SqPageKind, cell_count: Int, content_start: Int,
+                   right_most: Int) -> SqPageHeader
+    todo("sqlite-nv.sqfmt.page_header")
+
+// The kind byte 0 spells, or `SqBadPageKind`.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     match sqfmt.kind_of(13, 4)
+//         Ok(k)  => println("a leaf table page")
+//         Err(_) => println("not a b-tree page")
+// ```
+pub fn kind_of(byte0: Int, page_no: Int) -> Result<SqPageKind, sqerror.SqFault>
+    todo("sqlite-nv.sqfmt.kind_of")
+
+// The byte a kind is written as: 2, 5, 10 or 13.
+pub fn kind_byte(k: SqPageKind) -> Int
+    todo("sqlite-nv.sqfmt.kind_byte")
+
+// True for `SqLeafTable` and `SqLeafIndex`.
+pub fn is_leaf(k: SqPageKind) -> Bool
+    todo("sqlite-nv.sqfmt.is_leaf")
+
+// True for `SqInteriorTable` and `SqLeafTable` — the two that carry
+// rowids, as against the two that carry index keys.
+pub fn is_table(k: SqPageKind) -> Bool
+    todo("sqlite-nv.sqfmt.is_table")
+
+// The cell pointer array: `cell_count` offsets, in key order.
+//
+// Every offset is checked against `usable` before it is returned, so
+// a caller that walks the answer cannot be walked out of the page by
+// the file it is reading.  That check is the reason this returns a
+// `Result` rather than a list.
+pub fn cell_pointers(page: [Int], page_no: Int, usable: Int,
+                     h: SqPageHeader) -> Result<[Int], sqerror.SqFault>
+    todo("sqlite-nv.sqfmt.cell_pointers")
+
+// How many free bytes a page has for a new cell, counting the
+// freeblock chain and the fragments.
+//
+// Declared here rather than in `sqwrite` because it is arithmetic
+// over a page and nothing else, and because a reader that reports on
+// a file's fragmentation wants it without opening a transaction.
+pub fn free_bytes(page: [Int], page_no: Int, usable: Int,
+                  h: SqPageHeader) -> Result<Int, sqerror.SqFault>
+    todo("sqlite-nv.sqfmt.free_bytes")
+
+// ── the varint ───────────────────────────────────────────────────────
+
+// A decoded varint, and how many bytes it took.
+pub struct SqVarint
+    value: Int
+    bytes: Int
+
+// Decode SQLite's big-endian varint at `offset`.
+//
+// One to nine bytes: the first eight contribute seven bits each with
+// the high bit as the continuation flag, and the ninth contributes
+// all eight. Nine bytes is the end — a ninth byte with its high bit
+// set is `SqBadVarint`, not a tenth byte.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     match sqfmt.decode_varint([0x81, 0x00], 0, 1)
+//         Ok(v)  => println("${v.value} in ${v.bytes} bytes")
+//         Err(_) => println("bad varint")
+// ```
+pub fn decode_varint(buf: [Int], offset: Int, page_no: Int) -> Result<SqVarint, sqerror.SqFault>
+    todo("sqlite-nv.sqfmt.decode_varint")
+
+// Encode `n` as a varint, appended to `out`.
+pub fn encode_varint(out: [Int], n: Int) -> [Int]
+    todo("sqlite-nv.sqfmt.encode_varint")
+
+// How many bytes `n` encodes to, 1..9, without encoding it.
+//
+// A cell's size has to be known before the cell is built, and
+// building it to measure it is the shape that makes a writer
+// quadratic.
+pub fn varint_len(n: Int) -> Int
+    todo("sqlite-nv.sqfmt.varint_len")
+
+// ── the payload thresholds ───────────────────────────────────────────
+
+// How many bytes of a `total`-byte payload live ON the page, the rest
+// going to the overflow chain.
+//
+// THE MOST-OFTEN-GOT-WRONG ARITHMETIC IN THE FORMAT, so it is one
+// public function rather than four copies in the cell readers.  The
+// rule, with U the usable size:
+//
+//   X is `U - 35` on a table leaf and `((U - 12) * 64 / 255) - 23`
+//   on either index page.  A payload of X bytes or fewer is entirely
+//   local.  Otherwise M is `((U - 12) * 32 / 255) - 23` and K is
+//   `M + ((total - M) % (U - 4))`; the local part is K when K is at
+//   most X, and M when it is not.
+//
+// What the modulus is FOR, since it is the part that looks arbitrary:
+// it makes the last overflow page as full as possible, so a payload
+// that just crosses the threshold does not spend a whole page on four
+// bytes. A reader that dropped it reads the right number of bytes
+// from the page and then starts the chain at the wrong offset, which
+// produces a record that decodes — into the wrong values.
+//
+// ```novo
+// use sqfmt
+//
+// fn main() [io]
+//     println("${sqfmt.local_payload_bytes(4096, 5000, sqfmt.SqLeafTable)}")
+// ```
+pub fn local_payload_bytes(usable: Int, total: Int, k: SqPageKind) -> Int
+    todo("sqlite-nv.sqfmt.local_payload_bytes")
+
+// The largest payload that fits on a page of this kind with no
+// overflow at all — the X above.
+pub fn max_local_payload(usable: Int, k: SqPageKind) -> Int
+    todo("sqlite-nv.sqfmt.max_local_payload")
+
+// How many overflow pages a payload of `total` bytes needs.
+//
+// Published so a caller can price a row before reading it: a
+// megabyte BLOB on a 4 KiB page is 250 page reads, and a tool
+// scanning a table is entitled to decide not to.
+pub fn overflow_page_count(usable: Int, total: Int, k: SqPageKind) -> Int
+    todo("sqlite-nv.sqfmt.overflow_page_count")
+
+// How many bytes of payload an overflow page carries: `usable - 4`,
+// the four being the pointer to the next page in the chain.
+pub fn overflow_payload_bytes(usable: Int) -> Int
+    todo("sqlite-nv.sqfmt.overflow_payload_bytes")
+
+// ── the freelist ─────────────────────────────────────────────────────
+
+// A freelist trunk page, decoded.
+pub struct SqFreeTrunk
+    // The next trunk page, 0 at the end of the chain.
+    next_trunk: Int
+    // The pages this trunk points at.
+    leaves: [Int]
+
+// Decode a freelist trunk page.
+//
+// Checked against `usable`: a leaf count that would run off the page
+// is `SqOffsetOutOfPage` rather than a read past the end. A corrupt
+// freelist is the one structure a reader meets while the file is
+// otherwise fine, because nothing reads it until something writes.
+pub fn decode_free_trunk(page: [Int], page_no: Int,
+                         usable: Int) -> Result<SqFreeTrunk, sqerror.SqFault>
+    todo("sqlite-nv.sqfmt.decode_free_trunk")
+
+// How many page numbers a trunk page can hold: `(usable / 4) - 2`.
+pub fn free_trunk_capacity(usable: Int) -> Int
+    todo("sqlite-nv.sqfmt.free_trunk_capacity")

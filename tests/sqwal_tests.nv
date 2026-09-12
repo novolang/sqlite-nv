@@ -1,0 +1,180 @@
+// sqwal_tests.nv — the log, and the two endings a recovery must not
+// confuse with damage.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: sqlite-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE ENDINGS ARE THE TESTS.  A log that ends cleanly is the easy
+// case and every implementation gets it right.  The two that matter
+// are a half-written last frame and a frame left over from before a
+// checkpoint, and calling either one corruption throws away every
+// committed transaction in the log.  `ends_log` is the line between
+// them and it is asserted from both sides.
+
+use std.test
+use std.list
+use sqerror
+use sqwal
+
+@test
+fn test_a_header_round_trips_and_checks_its_own_checksum() [io]
+    let h = sqwal.new_header(4096, 3, 0x1111, 0x2222)
+
+    test.case("the fields are kept")
+    test.assert(h.page_size == 4096)
+    test.assert(h.checkpoint_seq == 3)
+    test.assert(h.salt1 == 0x1111)
+    test.assert(h.salt2 == 0x2222)
+
+    test.case("it encodes to exactly the header size")
+    test.assert(sqwal.header_size() == 32)
+    test.assert(list.len(sqwal.encode_header(h)) == sqwal.header_size())
+
+    test.case("and decodes back with its checksum checked")
+    match sqwal.decode_header(sqwal.encode_header(h), 4096)
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.assert(back.salt1 == 0x1111)
+            test.assert(back.checkpoint_seq == 3)
+
+    test.case("a log whose page size disagrees with the database is refused")
+    match sqwal.decode_header(sqwal.encode_header(h), 512)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and bytes that are not a header are refused")
+    match sqwal.decode_header([], 4096)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_frame_is_a_header_and_a_page_at_a_computed_offset() [io]
+    let h = sqwal.new_header(4096, 0, 1, 2)
+
+    test.case("frames are numbered from one, after the header")
+    test.assert(sqwal.frame_header_size() == 24)
+    test.assert(sqwal.frame_offset(4096, 1) == sqwal.header_size())
+    test.assert(sqwal.frame_offset(4096, 2)
+                == sqwal.header_size() + 24 + 4096)
+
+    test.case("a file's capacity is how many whole frames fit after the header")
+    test.assert(sqwal.frame_capacity(4096, 32) == 0)
+    test.assert(sqwal.frame_capacity(4096, 32 + 24 + 4096) == 1)
+
+    test.case("encoding a frame produces its header")
+    test.assert(list.len(sqwal.encode_frame(sqwal.frame(1, 0, 1, 2), [], h,
+                                            sqwal.checksum_seed(h))) >= 24)
+
+    test.case("and bytes that are not a frame are refused")
+    match sqwal.decode_frame([], [], h, 1, sqwal.checksum_seed(h))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_commit_record_is_the_frame_header_and_not_a_separate_frame() [io]
+    // A non-zero `db_size_after` IS the commit; a reader looking for a
+    // separate record never finds one and calls every transaction
+    // uncommitted.
+    test.case("a frame with a zero size does not commit")
+    test.assert(sqwal.frame_commits(sqwal.frame(7, 0, 1, 2)) == false)
+
+    test.case("and one with a non-zero size does")
+    test.assert(sqwal.frame_commits(sqwal.frame(7, 42, 1, 2)))
+
+@test
+fn test_a_frame_from_before_the_last_checkpoint_ends_the_log() [io]
+    // The log is written in place and never truncated, so old frames
+    // are still in the file.  The salts are what separate them, which
+    // is what makes a checkpoint cheap and recovery a forward scan.
+    let h = sqwal.new_header(4096, 5, 0x1111, 0x2222)
+
+    test.case("a frame carrying the header's salts belongs to this log")
+    test.assert(sqwal.frame_is_current(sqwal.frame(1, 0, 0x1111, 0x2222), h))
+
+    test.case("and one carrying the previous checkpoint's does not")
+    test.assert(sqwal.frame_is_current(sqwal.frame(1, 0, 0x1110, 0x2222), h) == false)
+    test.assert(sqwal.frame_is_current(sqwal.frame(1, 0, 0x1111, 0x2221), h) == false)
+
+@test
+fn test_a_torn_tail_ends_the_log_and_is_not_corruption() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR, from both sides.
+    test.case("a checksum that did not continue is an ending")
+    test.assert(sqwal.ends_log(sqerror.SqWalFrameChecksum(frame_no: 12)))
+
+    test.case("and a page that did not decode is not")
+    test.assert(sqwal.ends_log(sqerror.SqBadPageKind(page_no: 4, kind: 9)) == false)
+    test.assert(sqwal.ends_log(sqerror.SqNotADatabase(got_prefix: [])) == false)
+
+    test.case("the two also disagree about whether the file is damaged")
+    test.assert(sqerror.is_corruption(sqerror.SqBadPageKind(page_no: 4, kind: 9)))
+
+@test
+fn test_the_checksum_is_two_words_and_is_not_a_crc() [io]
+    let h = sqwal.new_header(4096, 0, 1, 2)
+
+    test.case("a fold starts from the header's own two words")
+    let seed = sqwal.checksum_seed(h)
+    test.assert(seed.s0 == h.checksum1)
+    test.assert(seed.s1 == h.checksum2)
+
+    test.case("and a bare fold starts from zero")
+    test.assert(sqwal.checksum_zero().s0 == 0)
+    test.assert(sqwal.checksum_zero().s1 == 0)
+
+    test.case("folding nothing changes nothing")
+    let c = sqwal.checksum(sqwal.checksum_zero(), [], true)
+    test.assert(c.s0 == 0)
+    test.assert(c.s1 == 0)
+
+    test.case("and the endianness is the magic's, not the machine's")
+    test.assert(sqwal.checksum(sqwal.checksum_zero(), [1, 2, 3, 4, 5, 6, 7, 8], true).s0
+                != sqwal.checksum(sqwal.checksum_zero(), [1, 2, 3, 4, 5, 6, 7, 8], false).s0)
+
+@test
+fn test_the_index_answers_the_newest_frame_for_a_page() [io]
+    let h = sqwal.new_header(4096, 0, 1, 2)
+    var ix = sqwal.index_new(h)
+
+    test.case("an empty index has nothing and no commits")
+    test.assert(list.len(ix.pages) == 0)
+    test.assert(ix.committed_frames == 0)
+    test.assert_none(sqwal.frame_for(ix, 3))
+
+    test.case("a frame puts its page in the index")
+    ix = sqwal.index_add(ix, 1, sqwal.frame(3, 0, 1, 2))
+    test.assert_some(sqwal.frame_for(ix, 3))
+
+    test.case("and a later frame for the same page replaces it")
+    ix = sqwal.index_add(ix, 2, sqwal.frame(3, 9, 1, 2))
+    match sqwal.frame_for(ix, 3)
+        None    => test.assert(false)
+        Some(n) => test.assert(n == 2)
+
+    test.case("a commit moves the committed count and the page count")
+    test.assert(ix.committed_frames == 2)
+    test.assert(ix.db_page_count == 9)
+
+@test
+fn test_a_checkpoint_stops_where_the_oldest_reader_is() [io]
+    // The one rule a checkpoint can get wrong: copying past a reader's
+    // snapshot changes a page under a query that is mid-flight, which
+    // does not fail — it answers a row from two transactions at once.
+    let h = sqwal.new_header(4096, 0, 1, 2)
+    var ix = sqwal.index_new(h)
+    ix = sqwal.index_add(ix, 1, sqwal.frame(3, 0, 1, 2))
+    ix = sqwal.index_add(ix, 2, sqwal.frame(4, 9, 1, 2))
+
+    test.case("with no reader it may copy every committed frame")
+    test.assert(sqwal.checkpoint_limit(ix, 2, sqwal.SqPassive) == 2)
+
+    test.case("with a reader at frame 1 it may copy no further")
+    test.assert(sqwal.checkpoint_limit(ix, 1, sqwal.SqPassive) <= 1)
+
+    test.case("and a reader at the start stops it entirely")
+    test.assert(sqwal.checkpoint_limit(ix, 0, sqwal.SqFull) == 0)
+
+    test.case("only a full copy may restart the log with fresh salts")
+    test.assert(sqwal.may_restart(sqwal.SqPassive, 2, ix) == false)
+    test.assert(sqwal.may_restart(sqwal.SqRestart, 0, ix) == false)
+    test.assert(sqwal.may_restart(sqwal.SqTruncate, 2, ix))

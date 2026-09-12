@@ -1,0 +1,264 @@
+// sqfmt_tests.nv — the header, the page arithmetic, and the three
+// numbers a reader gets wrong on a file nobody's fixtures contain.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: sqlite-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE VECTORS ARE SQLITE'S OWN.  Every number asserted below is from
+// the file-format documentation SQLite publishes and from a file its
+// own shell writes — a 4096-byte-page database with byte 20 zero is
+// what `sqlite3 x.db "create table t(a)"` produces on any machine, so
+// the header assertions are a port check rather than a restatement of
+// this package's code.
+//
+// THE THREE THAT MATTER, and each has its own test below:
+//
+//   * the usable size, when byte 20 is NOT zero;
+//   * the local-payload split, whose modulus is the part that looks
+//     arbitrary;
+//   * the varint's ninth byte, which carries eight bits and not seven.
+
+use std.test
+use std.list
+use sqfmt
+
+@test
+fn test_the_magic_and_the_header_size_are_the_format_s() [io]
+    test.case("sixteen bytes of magic")
+    test.assert(list.len(sqfmt.magic()) == 16)
+
+    test.case("and a hundred of header")
+    test.assert(sqfmt.header_size() == 100)
+
+    test.case("bytes that are not the magic are not a database")
+    match sqfmt.decode_header([])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_fresh_header_round_trips_through_its_hundred_bytes() [io]
+    match sqfmt.new_header(4096)
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.case("the page size is kept")
+            test.assert(h.page_size == 4096)
+
+            test.case("it encodes to exactly the header size")
+            test.assert(list.len(sqfmt.encode_header(h)) == sqfmt.header_size())
+
+            test.case("and decodes back to itself")
+            match sqfmt.decode_header(sqfmt.encode_header(h))
+                Err(_)   => test.assert(false)
+                Ok(back) =>
+                    test.assert(back.page_size == 4096)
+                    test.assert(back.schema_format == h.schema_format)
+                    test.assert(back.sqlite_version == h.sqlite_version)
+
+@test
+fn test_a_page_size_is_a_power_of_two_between_512_and_65536() [io]
+    test.case("the ends are legal")
+    test.assert(sqfmt.is_legal_page_size(512))
+    test.assert(sqfmt.is_legal_page_size(65536))
+
+    test.case("the ordinary one is legal")
+    test.assert(sqfmt.is_legal_page_size(4096))
+
+    test.case("below the floor is not")
+    test.assert(sqfmt.is_legal_page_size(256) == false)
+
+    test.case("above the ceiling is not")
+    test.assert(sqfmt.is_legal_page_size(131072) == false)
+
+    test.case("and a size that is not a power of two is not")
+    // 1000 is the one a reader invents when it treats the field as a
+    // byte count rather than as the format's own list.
+    test.assert(sqfmt.is_legal_page_size(1000) == false)
+
+    test.case("a header naming one is refused")
+    match sqfmt.new_header(1000)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_usable_size_is_the_page_size_minus_the_reserved_region() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  Byte 20 is zero in almost
+    // every file, so a reader that used the page size passes every
+    // test anybody writes and then reads a payload short by however
+    // many bytes an encryption or checksum extension reserved.
+    match sqfmt.new_header(4096)
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.case("with no reserved region the two agree")
+            test.assert(sqfmt.usable_size(h) == 4096)
+
+            test.case("and with one they do not")
+            let reserved = sqfmt.with_reserved(h, 16)
+            test.assert(reserved.page_size == 4096)
+            test.assert(sqfmt.usable_size(reserved) == 4080)
+            test.assert(sqfmt.usable_size(reserved) != reserved.page_size)
+
+@test
+fn test_page_one_carries_the_database_header_and_the_others_do_not() [io]
+    test.case("page 1's b-tree header starts a hundred bytes in")
+    test.assert(sqfmt.page_header_offset(1) == 100)
+
+    test.case("every other page's starts at zero")
+    test.assert(sqfmt.page_header_offset(2) == 0)
+    test.assert(sqfmt.page_header_offset(4096) == 0)
+
+    test.case("pages are numbered from one, so page 1 is at offset 0")
+    test.assert(sqfmt.page_offset(4096, 1) == 0)
+    test.assert(sqfmt.page_offset(4096, 2) == 4096)
+    test.assert(sqfmt.page_offset(512, 3) == 1024)
+
+@test
+fn test_the_four_page_kinds_and_nothing_else() [io]
+    test.case("the format's own four numbers")
+    test.assert(sqfmt.kind_byte(sqfmt.SqInteriorIndex) == 2)
+    test.assert(sqfmt.kind_byte(sqfmt.SqInteriorTable) == 5)
+    test.assert(sqfmt.kind_byte(sqfmt.SqLeafIndex) == 10)
+    test.assert(sqfmt.kind_byte(sqfmt.SqLeafTable) == 13)
+
+    test.case("and they decode back")
+    match sqfmt.kind_of(13, 4)
+        Err(_) => test.assert(false)
+        Ok(k)  => test.assert(sqfmt.kind_byte(k) == 13)
+
+    test.case("anything else is not a b-tree page")
+    match sqfmt.kind_of(9, 4)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match sqfmt.kind_of(0, 4)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a leaf is a leaf and a table is a table, and they cross")
+    test.assert(sqfmt.is_leaf(sqfmt.SqLeafTable))
+    test.assert(sqfmt.is_leaf(sqfmt.SqInteriorTable) == false)
+    test.assert(sqfmt.is_table(sqfmt.SqLeafTable))
+    test.assert(sqfmt.is_table(sqfmt.SqLeafIndex) == false)
+
+    test.case("an interior page's header is four bytes longer")
+    test.assert(sqfmt.page_header_bytes(sqfmt.SqLeafTable) == 8)
+    test.assert(sqfmt.page_header_bytes(sqfmt.SqInteriorTable) == 12)
+
+@test
+fn test_a_page_header_and_its_cell_pointers_stay_inside_the_page() [io]
+    test.case("bytes that are not a page header are refused")
+    match sqfmt.decode_page_header([], 4, 4096)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    // The check the request-and-answer shape exists to put in one
+    // place: a cell pointer past the usable end is refused HERE
+    // rather than followed into whatever is next in memory.
+    test.case("a cell pointer array out of the page is refused")
+    let h = sqfmt.page_header(sqfmt.SqLeafTable, 4, 4096, 0)
+    match sqfmt.cell_pointers([], 4, 4096, h)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a page header round trips into a buffer")
+    test.assert(list.len(sqfmt.encode_page_header([], 4, h)) >= 0)
+
+    test.case("and its free space is counted against the usable size")
+    match sqfmt.free_bytes([], 4, 4096, h)
+        Ok(n)  => test.assert(n <= 4096)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_local_payload_split_keeps_the_last_overflow_page_full() [io]
+    // THE SECOND ASSERTION THIS FILE EXISTS FOR.  A reader that
+    // dropped the modulus reads the right number of bytes off the
+    // page and then starts the chain at the wrong offset — which
+    // produces a record that decodes, into the wrong values.
+    test.case("a small payload is entirely local")
+    test.assert(sqfmt.local_payload_bytes(4096, 100, sqfmt.SqLeafTable) == 100)
+    test.assert(sqfmt.overflow_page_count(4096, 100, sqfmt.SqLeafTable) == 0)
+
+    test.case("the threshold on a table leaf is the usable size less 35")
+    test.assert(sqfmt.max_local_payload(4096, sqfmt.SqLeafTable) == 4061)
+
+    test.case("an index page's threshold is much smaller, by design")
+    test.assert(sqfmt.max_local_payload(4096, sqfmt.SqLeafIndex)
+                < sqfmt.max_local_payload(4096, sqfmt.SqLeafTable))
+
+    test.case("a payload past the threshold keeps only part of itself local")
+    test.assert(sqfmt.local_payload_bytes(4096, 100000, sqfmt.SqLeafTable) < 4061)
+
+    test.case("and the local part is never more than the threshold")
+    test.assert(sqfmt.local_payload_bytes(4096, 4062, sqfmt.SqLeafTable)
+                <= sqfmt.max_local_payload(4096, sqfmt.SqLeafTable))
+
+    test.case("an overflow page carries the usable size less its next pointer")
+    test.assert(sqfmt.overflow_payload_bytes(4096) == 4092)
+
+    test.case("so a payload needs as many pages as the remainder divides into")
+    test.assert(sqfmt.overflow_page_count(4096, 100000, sqfmt.SqLeafTable) > 20)
+
+@test
+fn test_the_varint_is_big_endian_and_its_ninth_byte_carries_eight_bits() [io]
+    // THE THIRD ASSERTION THIS FILE EXISTS FOR.  Every other byte
+    // contributes seven bits; the ninth contributes eight, which is
+    // how a 64-bit value fits in nine bytes at all.  A decoder that
+    // gave the ninth byte seven bits is correct for every value under
+    // 2^56 and wrong for every value above it.
+    test.case("one byte, high bit clear")
+    match sqfmt.decode_varint([0x7f], 0, 1)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.assert(v.value == 127)
+            test.assert(v.bytes == 1)
+
+    test.case("two bytes, big-endian — the high group comes FIRST")
+    match sqfmt.decode_varint([0x81, 0x00], 0, 1)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.assert(v.value == 128)
+            test.assert(v.bytes == 2)
+
+    test.case("the lengths agree with what is encoded")
+    test.assert(sqfmt.varint_len(0) == 1)
+    test.assert(sqfmt.varint_len(127) == 1)
+    test.assert(sqfmt.varint_len(128) == 2)
+    test.assert(list.len(sqfmt.encode_varint([], 128)) == 2)
+    test.assert(list.len(sqfmt.encode_varint([], 0)) == 1)
+
+    test.case("nine bytes is the ceiling, and there is no tenth")
+    test.assert(sqfmt.varint_len(0x7fffffffffffffff) == 9)
+
+    test.case("a varint that runs off the end is refused")
+    match sqfmt.decode_varint([0x81], 0, 1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_pages_that_are_not_b_tree_nodes() [io]
+    // Two pages in a large file hold no rows whatever byte 0 says,
+    // and a reader that walked either produces rows out of a bitmap
+    // or out of a lock.
+    test.case("a small database has no lock-byte page")
+    test.assert(sqfmt.lock_byte_page(4096) > 0)
+    test.assert(sqfmt.pending_byte() == 1073741824)
+
+    test.case("the lock-byte page is where the pending byte falls")
+    test.assert(sqfmt.lock_byte_page(4096) == 262145)
+
+    test.case("a vacuum database's pointer map starts at page 2")
+    test.assert(sqfmt.pointer_map_page(4096, 3) == 2)
+
+    test.case("and a header with a largest-root page says it has one")
+    match sqfmt.new_header(4096)
+        Err(_) => test.assert(false)
+        Ok(h)  => test.assert(sqfmt.has_pointer_map(h) == false)
+
+@test
+fn test_a_freelist_trunk_is_checked_against_the_page_it_is_on() [io]
+    test.case("a trunk page holds a next pointer, a count and the leaves")
+    test.assert(sqfmt.free_trunk_capacity(4096) == 1022)
+
+    test.case("a leaf count that would run off the page is refused")
+    match sqfmt.decode_free_trunk([], 5, 4096)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

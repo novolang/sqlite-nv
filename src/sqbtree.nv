@@ -1,0 +1,345 @@
+// sqbtree.nv — the cells on a page, and a cursor that walks a tree by
+// ASKING for pages rather than reading them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS THE PACKAGE'S LOAD-BEARING INTERFACE, and it is one
+// enum: `SqPageRequest`.  The only way anything here obtains a byte of
+// a database is by naming a page number and being handed that page's
+// bytes.  Nothing opens, seeks, maps or reads; `sqfile` does all four
+// and answers.
+//
+// WHY THAT IS THE SHAPE FOR THIS FORMAT IN PARTICULAR.  A SQLite file
+// is the most widely exchanged binary format there is — a phone
+// backup, a browser profile, a mail store, an attachment — so the
+// realistic input to this package is a file somebody else wrote, and
+// possibly wrote on purpose.  A reader that held a byte buffer and an
+// offset has one defence against a hostile file, which is checking
+// every offset it computes, and it has to get every one of them
+// right.  A reader that can only say "give me page 47" has a
+// different property: the worst a corrupt interior page can do is
+// name a page that does not exist, and `sqfile` answers
+// `SqNoSuchPage` because it knows the file's length and the cursor
+// does not.  Out-of-range is answered by the party that can answer
+// it, once, instead of being checked by every decode site.
+//
+// Two rules make the requests correct rather than merely bounded, and
+// both live next door in `sqfmt`:
+//
+//   * every offset is checked against `sqfmt.usable_size`, never
+//     against the page size;
+//   * every payload length is split by `sqfmt.local_payload_bytes`,
+//     whose modulus is the part that looks arbitrary and is not.
+//
+// A CURSOR IS A VALUE AND A STEP ANSWERS A NEW ONE.  Two cursors over
+// one tree cannot alias, which is what lets a join hold an outer walk
+// and an inner seek with no lock and no copy of the file — SPEC § 14's
+// `@value` shape doing the work a page-cache pin would otherwise do.
+//
+// THE DEPTH BOUND IS NOT AN OPTIMISATION.  A corrupt interior page
+// whose child pointer names an ancestor makes a descent loop forever,
+// and the loop is silent — it reads pages that decode, in an order
+// that never terminates.  `SqTreeTooDeep` ends it, and the bound is a
+// function of the page count because a b-tree over N pages cannot be
+// deeper than N.
+
+use sqerror
+use sqfmt
+use sqrec
+
+// What the cursor needs done before it can continue.
+//
+// THE PACKAGE'S LOAD-BEARING INTERFACE — see the module comment.
+//
+// Deliberately NOT btree-nv's `PageRequest`, which names the same
+// idea about a different tree: btree-nv describes novo-lang's own B+
+// tree, with a 16-byte page header, `Int` keys and `cell.encode_row`
+// payloads.  A SQLite page has none of that, and one enum covering
+// both would be an enum whose consumer has to know which format the
+// page it is about is in.
+pub enum SqPageRequest
+    // Read this page and hand it back with `feed_page`.  The only
+    // request a read-only cursor ever makes.
+    SqNeedPage(page_no: Int)
+    // Store these `page_size` bytes as this page.  Only `sqwrite`'s
+    // cursors produce it; the host may buffer rather than write, and
+    // the cursor does not step again on an answer.
+    SqPutPage(page_no: Int, bytes: [Int])
+    // Take a page off the freelist, or grow the file, and hand the
+    // number back with `feed_alloc`.
+    SqTakePage
+    // This page is no longer reachable.  Whether it joins the
+    // freelist now or at commit is the writer's decision, not the
+    // tree's.
+    SqDropPage(page_no: Int)
+
+// What a cursor is doing, which is what decides how it descends.
+pub enum SqWalk
+    // Every row of a table b-tree, in rowid order.
+    SqScanTable
+    // One rowid.
+    SqSeekRowid
+    // Rowids in `[low, high]`.
+    SqRangeRowid
+    // Every entry of an index b-tree, in key order.
+    SqScanIndex
+    // The first index entry at or after a key.
+    SqSeekIndex
+
+// One cell of a table b-tree leaf, decoded far enough to know what to
+// ask for next.
+pub struct SqTableCell
+    // The row's key.  A table b-tree is keyed by rowid and by nothing
+    // else — `WITHOUT ROWID` tables are index b-trees and are read by
+    // the index side of this module.
+    rowid: Int
+    // The payload's length in bytes, local part and overflow together.
+    payload_bytes: Int
+    // How many of those bytes are on this page.
+    local_bytes: Int
+    // The first page of the overflow chain, 0 when there is none.
+    overflow_first: Int
+    // Where the local payload starts inside the page.
+    local_offset: Int
+
+// One cell of an index b-tree page.
+pub struct SqIndexCell
+    payload_bytes: Int
+    local_bytes: Int
+    overflow_first: Int
+    local_offset: Int
+    // The child page to the LEFT of this key, 0 on a leaf.
+    left_child: Int
+
+// What one `step` produced.
+pub enum SqStep
+    // A row of a table b-tree: its rowid, and its record.
+    SqRow(rowid: Int, values: [sqrec.SqValue])
+    // An entry of an index b-tree.  The last value of an index record
+    // is the rowid it points at, which is why there is no separate
+    // field for it — the format puts it in the record and so does
+    // this.
+    SqEntry(values: [sqrec.SqValue])
+    // The walk finished.  `rows` is how many it produced.
+    SqWalkDone(rows: Int)
+    // The cursor needs the host to do something first.
+    SqNeed(request: SqPageRequest)
+    // The walk failed.  A later `step` repeats this.
+    SqWalkFailed(fault: sqerror.SqFault)
+
+// A cursor and the step it just took.
+//
+// Named `SqAdvance` rather than `Advance` because sql-engine-nv
+// already publishes an `Advance` with different fields, and struct
+// identity is keyed by NAME across a whole assembly (E2004).  A
+// package that names a common noun takes it from every consumer.
+pub struct SqAdvance
+    cursor: SqCursor
+    step: SqStep
+
+// A position in a walk, and everything the walk still needs.
+//
+// The fields are the state machine's own and are NOT a stable surface
+// below 1.0 — a consumer reads `SqAdvance.step` and calls the
+// functions below.  They are declared rather than hidden because a
+// reviewer of an interface is reviewing exactly this claim: that
+// walking a SQLite b-tree needs a path, a slot per level, one page in
+// hand, and an overflow accumulator, and nothing else a host would
+// have to keep for it.
+pub struct SqCursor
+    // The page the tree is rooted at, from the schema table.
+    root: Int
+    // What this cursor is doing.
+    walk: SqWalk
+    // The usable size this tree's file was opened with.  Carried
+    // rather than fetched because every offset check needs it and a
+    // cursor that had to ask for the header to check an offset would
+    // ask once per page.
+    usable: Int
+    // The file's text encoding, for the records this cursor decodes.
+    encoding: sqfmt.SqTextEncoding
+    // The rowid bounds, for the three rowid walks.
+    low: Int
+    high: Int
+    // The index key bound, for `SqSeekIndex`; empty otherwise.
+    key: [sqrec.SqValue]
+    // Page numbers from the root down to the page under the cursor.
+    path: [Int]
+    // The cell index reached within each page on `path`.
+    slots: [Int]
+    // The page the cursor asked for and has not been fed, 0 when it
+    // is not waiting.
+    awaiting: Int
+    // Payload bytes gathered from an overflow chain so far, and the
+    // next page of that chain.  A chain is walked one page per step,
+    // so a ten-megabyte BLOB does not block the host's loop.
+    spill: [Int]
+    spill_next: Int
+    // How many rows or entries the walk has produced.
+    produced: Int
+    // Set once the walk has failed; every later `step` repeats it.
+    failed: ?sqerror.SqFault
+
+// ── starting a walk ──────────────────────────────────────────────────
+
+// Every row of the table rooted at `root`, in rowid order.
+//
+// ```novo
+// use sqbtree
+// use sqfmt
+//
+// fn main() [io]
+//     let c = sqbtree.scan_table(2, 4096, sqfmt.SqUtf8)
+//     println("${c.root}")
+// ```
+pub fn scan_table(root: Int, usable: Int, encoding: sqfmt.SqTextEncoding) -> SqCursor
+    todo("sqlite-nv.sqbtree.scan_table")
+
+// The one row with this rowid, or none.
+//
+// ```novo
+// use sqbtree
+// use sqfmt
+//
+// fn main() [io]
+//     println("${sqbtree.seek_rowid(2, 4096, sqfmt.SqUtf8, 17).low}")
+// ```
+pub fn seek_rowid(root: Int, usable: Int, encoding: sqfmt.SqTextEncoding, rowid: Int) -> SqCursor
+    todo("sqlite-nv.sqbtree.seek_rowid")
+
+// Rows whose rowid is in `[low, high]`, in rowid order.
+pub fn range_rowid(root: Int, usable: Int, encoding: sqfmt.SqTextEncoding, low: Int,
+                   high: Int) -> SqCursor
+    todo("sqlite-nv.sqbtree.range_rowid")
+
+// Every entry of the index rooted at `root`, in key order.
+pub fn scan_index(root: Int, usable: Int, encoding: sqfmt.SqTextEncoding) -> SqCursor
+    todo("sqlite-nv.sqbtree.scan_index")
+
+// The first index entry at or after `key`, then the ones after it.
+//
+// `key` may be shorter than the index's columns — a two-column index
+// seeks on its first column alone — which is what makes an index
+// useful for a prefix and not only for an exact match.
+pub fn seek_index(root: Int, usable: Int, encoding: sqfmt.SqTextEncoding,
+                  key: [sqrec.SqValue]) -> SqCursor
+    todo("sqlite-nv.sqbtree.seek_index")
+
+// ── the loop ─────────────────────────────────────────────────────────
+
+// Advance a cursor once.
+//
+// Every call answers exactly one of: a row, an entry, a request, the
+// end, or a failure.  A cursor that is waiting for a page answers the
+// same request again rather than looping, so a host that ignores a
+// request does not spin the cursor forward past a page it never got.
+//
+// ```novo
+// use sqbtree
+// use sqfmt
+//
+// fn main() [io]
+//     let c = sqbtree.scan_table(2, 4096, sqfmt.SqUtf8)
+//     match sqbtree.step(c).step
+//         SqRow(id, vs)    => println("row ${id}")
+//         SqEntry(vs)      => println("an index entry")
+//         SqWalkDone(n)    => println("${n} rows")
+//         SqNeed(r)        => println("the host's turn")
+//         SqWalkFailed(f)  => println("failed")
+// ```
+pub fn step(c: SqCursor) -> SqAdvance
+    todo("sqlite-nv.sqbtree.step")
+
+// Hand back a page the cursor asked for.
+//
+// `bytes` is the whole page, from its first byte — on page 1 that
+// includes the hundred bytes of database header, and
+// `sqfmt.page_header_offset` is what steps over them.  Feeding a page
+// the cursor did not ask for is not an error and not useful: it is
+// dropped.
+pub fn feed_page(c: SqCursor, page_no: Int, bytes: [Int]) -> SqCursor
+    todo("sqlite-nv.sqbtree.feed_page")
+
+// Hand back the number of a page the cursor asked to have allocated.
+pub fn feed_alloc(c: SqCursor, page_no: Int) -> SqCursor
+    todo("sqlite-nv.sqbtree.feed_alloc")
+
+// The page the cursor is waiting for, or `None`.
+//
+// A host that batches reads asks this before it asks for the step, so
+// it can fetch a run of pages in one syscall.
+pub fn awaiting(c: SqCursor) -> ?Int
+    todo("sqlite-nv.sqbtree.awaiting")
+
+// How deep a tree over this many pages is allowed to get.
+//
+// The bound that ends a cycle in the child pointers — see the module
+// comment.  Published so a caller reading a report of `SqTreeTooDeep`
+// can see the number it was measured against rather than guess.
+pub fn depth_limit(page_count: Int) -> Int
+    todo("sqlite-nv.sqbtree.depth_limit")
+
+// ── cells ────────────────────────────────────────────────────────────
+
+// Decode the cell at `offset` on a table b-tree leaf.
+//
+// The format: a varint payload length, a varint rowid, the local
+// payload, and — only when the payload overflowed — four bytes naming
+// the first overflow page.  `local_bytes` comes from
+// `sqfmt.local_payload_bytes` and not from what is left on the page.
+pub fn table_leaf_cell(page: [Int], page_no: Int, usable: Int,
+                       offset: Int) -> Result<SqTableCell, sqerror.SqFault>
+    todo("sqlite-nv.sqbtree.table_leaf_cell")
+
+// Decode the cell at `offset` on a table b-tree INTERIOR page: four
+// bytes of left child, then a varint rowid and nothing else.
+//
+// An interior table page carries no payload at all, which is why a
+// rowid lookup costs one page per level and not one page plus a
+// record decode per level.
+pub fn table_interior_cell(page: [Int], page_no: Int, usable: Int,
+                           offset: Int) -> Result<SqTableCell, sqerror.SqFault>
+    todo("sqlite-nv.sqbtree.table_interior_cell")
+
+// Decode the cell at `offset` on an index b-tree page, leaf or
+// interior.
+//
+// The two differ by four bytes of left child on the front, and by
+// nothing else — so one function takes the kind rather than two
+// functions sharing a body.
+pub fn index_cell(page: [Int], page_no: Int, usable: Int, offset: Int,
+                  kind: sqfmt.SqPageKind) -> Result<SqIndexCell, sqerror.SqFault>
+    todo("sqlite-nv.sqbtree.index_cell")
+
+// ── overflow ─────────────────────────────────────────────────────────
+
+// The next page of an overflow chain, and this page's share of the
+// payload.
+//
+// An overflow page is four bytes of next-page pointer and then
+// `usable - 4` bytes of payload, with no header, no checksum and
+// nothing saying how much of the last page is used — the payload
+// length in the cell is the only thing that ends the chain.  A reader
+// that walked until the pointer was zero and took every byte it
+// passed appends up to `usable - 4` bytes of whatever was in that
+// page before, which decodes.
+//
+// `remaining` is what is still owed, and `next` is 0 at the end.
+pub struct SqOverflowPart
+    bytes: [Int]
+    next: Int
+    remaining: Int
+
+// Take this overflow page's share of a payload.
+//
+// ```novo
+// use sqbtree
+//
+// fn main() [io]
+//     match sqbtree.overflow_part([], 9, 4096, 100)
+//         Ok(p)  => println("${p.remaining} to go")
+//         Err(_) => println("bad chain")
+// ```
+pub fn overflow_part(page: [Int], page_no: Int, usable: Int,
+                     remaining: Int) -> Result<SqOverflowPart, sqerror.SqFault>
+    todo("sqlite-nv.sqbtree.overflow_part")

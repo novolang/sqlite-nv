@@ -1,0 +1,289 @@
+// sqdriver.nv — the `std.sql` driver: a `Database` a program can hold
+// without naming an engine, over a real SQLite file.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHAT A `std.sql` DRIVER IS, EXACTLY.  The standard library declares
+// one vendor-connect contract for engines — the prelude's `Database`
+// trait, with `close`, `exec` and `query_count` — and a program
+// written against `dyn Database` runs over whichever engine it is
+// handed.  `SqDatabase` below implements it, so this:
+//
+//   fn migrate(db: dyn Database) -> Str [io, fs]
+//       match db.exec("CREATE TABLE t (n INTEGER)")
+//
+// runs against a SQLite file this package opened, against the
+// standard library's own `SqliteDb`, and against postgres-nv's
+// `PgDatabase`, with nothing in it naming any of the three.
+//
+// THE CONTRACT IS NARROW AND THAT IS ON PURPOSE.  It has no Rows/Row
+// surface and no transaction type, because those are not the
+// intersection every engine can honour with the type system as it
+// stands — `docs/stdlib/traits.md` says so, and widening it is a
+// contract change rather than an implementation detail.  So the trait
+// gives a program engine independence and this package's own
+// functions give it rows: `query`, `prepare` and `step` below are
+// INHERENT and name `sqrec.SqValue`, and a caller that wants rows has
+// chosen SQLite by then anyway.
+//
+// THE EFFECT ROW ON THE IMPL IS `[fs]`, WHICH THE TRAIT DOES NOT
+// DECLARE — the trait's members say `[io]`.  That is legal: a trait
+// with no effect parameter does not pin its impls' rows, and the
+// standard library's own `SqliteDb` does exactly the same thing.  It
+// is worth knowing what it costs: a `dyn Database` call is charged
+// the UNION over every impl in the program (SPEC § 5.6), so a program
+// that links this package AND a network engine pays `[fs, net]` on
+// every `dyn` call even where it only ever holds a file.  A concrete
+// `SqDatabase` receiver is charged `[fs]` alone.  The fix is the same
+// one `Connection` is waiting on — an effect parameter on the trait —
+// and the README names it.
+//
+// THE QUERY HALF IS sql-engine-nv's AND THE STORAGE HALF IS THIS
+// PACKAGE'S, and the seam between them is the one design decision in
+// this module.  The engine parses, checks against a catalogue and
+// plans; `sqbtree` walks the file.  What the engine's own step
+// protocol cannot do is answer from a SQLite page: `sqlengine.step`
+// asks for pages by `btree.PageRequest` and decodes what it is handed
+// with btree-nv's node format, which is novo-lang's own B+ tree.  So
+// the engine is never fed a page from a SQLite database, and
+// `prepare` below drives it for parse, plan and expression evaluation
+// only.  The row that would close the seam is an EXTERNAL-CURSOR feed
+// on sql-engine-nv — rows in rather than pages in, which is SQLite's
+// own virtual-table mechanism by another name — and the README names
+// it as a missing row on the grid rather than a gap here.
+//
+// The dependency is not in the manifest yet for an unrelated reason;
+// the manifest says which, and nothing in the surface below changes
+// when it lands.
+
+use sqbtree
+use sqerror
+use sqfile
+use sqrec
+use sqschema
+
+// A SQLite database, as a `Database`.
+//
+// Named `SqDatabase` and not `SqliteDb`: the standard library already
+// declares `SqliteDb` for its own subprocess-backed implementation,
+// and struct identity is keyed by NAME across a whole assembly
+// (E2004), so a program could not hold both.
+pub struct SqDatabase
+    file: sqfile.SqDatabaseFile
+    catalogue: sqfile.SqCatalogue
+
+// A prepared statement.
+//
+// Named `SqStatement` and not `Statement`: sql-engine-nv publishes a
+// `Statement` with different fields, and a package that names a
+// common noun takes it from every consumer.
+pub struct SqStatement
+    sql: Str
+    // The column names the rows will carry, answered before a row is
+    // produced — a caller drawing a table header cannot wait for a
+    // row that may never come.
+    columns: [Str]
+    // The table this statement reads, by position in the catalogue.
+    // A statement over more than one is a join, and the first cut
+    // refuses it — see the README's scope.
+    table: Int
+    // The schema cookie this statement was planned against.  A
+    // statement outliving its schema reads the wrong column, so
+    // `step` compares and answers `SqBadSchemaRow` rather than rows.
+    cookie: Int
+    // The cursor the walk is on.
+    cursor: sqbtree.SqCursor
+
+// What one `step` of a statement produced.
+pub enum SqQueryStep
+    // One row, in the statement's column order.
+    SqQueryRow(values: [sqrec.SqValue])
+    // The statement finished.  `affected` is the row count for a
+    // SELECT and the number of rows changed for everything else.
+    SqQueryDone(affected: Int)
+    // The statement failed.  A later `step` repeats this.
+    SqQueryFailed(fault: sqerror.SqFault)
+
+// A statement advanced once, and the database it advanced against.
+pub struct SqQueryAdvance
+    db: SqDatabase
+    statement: SqStatement
+    step: SqQueryStep
+
+// ── the trait ────────────────────────────────────────────────────────
+
+// The prelude `Database` contract, over a real SQLite file.
+//
+// ```novo
+// use sqdriver
+//
+// fn main() [io, fs]
+//     match sqdriver.open("/tmp/app.db")
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match db.exec("CREATE TABLE t (n INTEGER)")
+//                 Some(e) => println("failed")
+//                 None    => println("ok")
+// ```
+impl Database for SqDatabase
+    // Close the file and release every lock.
+    fn close(self) [fs]
+        todo("sqlite-nv.sqdriver.close")
+
+    // Run a statement that returns no rows.
+    //
+    // `None` is success.  A failure is classified into the prelude's
+    // `DbError` as far as the format allows: a statement the parser
+    // refused is `SyntaxError`, a table that is not there is
+    // `DbNotFound`, a unique index that already holds the key is
+    // `ConstraintViolation`, and anything about the FILE —
+    // unreadable, locked, corrupt — is `ConnectionError` carrying
+    // `sqerror.describe`.  The fault itself is not lost: `last_fault`
+    // answers it with the page number the contract has no room for.
+    fn exec(self, sql: Str) -> ?DbError [fs]
+        todo("sqlite-nv.sqdriver.exec")
+
+    // How many rows `sql` produces.
+    //
+    // Runs the statement and counts; there is no plan-time row
+    // estimate in this package and inventing one would make a caller
+    // think it had asked a cheap question.
+    fn query_count(self, sql: Str) -> Result<Int, DbError> [fs]
+        todo("sqlite-nv.sqdriver.query_count")
+
+// ── opening ──────────────────────────────────────────────────────────
+
+// Open a database and read its catalogue.
+//
+// ```novo
+// use sqdriver
+//
+// fn main() [io, fs]
+//     match sqdriver.open("/tmp/app.db")
+//         Ok(db) => println("opened")
+//         Err(_) => println("could not open")
+// ```
+pub fn open(path: Str) -> Result<SqDatabase, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqdriver.open")
+
+// Open for reading only — the mode this package is for.
+pub fn open_read_only(path: Str) -> Result<SqDatabase, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqdriver.open_read_only")
+
+// The fault behind the last `DbError` this handle answered, or
+// `None`.
+//
+// The prelude's `DbError` has five variants and a message; a
+// `sqerror.SqFault` names a page, an offset and a feature.  A caller
+// written against `dyn Database` gets the first; a caller that has
+// chosen this engine can ask for the second, which is the only place
+// "page 4192 did not decode" survives the contract.
+pub fn last_fault(db: SqDatabase) -> ?sqerror.SqFault
+    todo("sqlite-nv.sqdriver.last_fault")
+
+// The tables and indexes this database holds.
+pub fn catalogue(db: SqDatabase) -> sqfile.SqCatalogue
+    todo("sqlite-nv.sqdriver.catalogue")
+
+// ── rows ─────────────────────────────────────────────────────────────
+
+// Parse, check and plan one statement.
+//
+// The errors that come out of here are the ones that need no data: a
+// syntax error, an unknown table or column, a form this port does not
+// execute.  Everything that needs a row arrives from `step`.
+//
+// ```novo
+// use sqdriver
+//
+// fn main() [io, fs]
+//     match sqdriver.open_read_only("/tmp/app.db")
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match sqdriver.prepare(db, "SELECT n FROM t")
+//                 Ok(st) => println("prepared")
+//                 Err(_) => println("refused")
+// ```
+pub fn prepare(db: SqDatabase, sql: Str) -> Result<SqStatement, sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqdriver.prepare")
+
+// The column names a prepared statement's rows will carry.
+//
+// Available before the first `step`, because a caller that has to
+// draw a header cannot wait for a row that may never come.
+pub fn columns(st: SqStatement) -> [Str]
+    todo("sqlite-nv.sqdriver.columns")
+
+// Advance a statement once.
+//
+// ```novo
+// use sqdriver
+//
+// fn main() [io, fs]
+//     match sqdriver.open_read_only("/tmp/app.db")
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match sqdriver.prepare(db, "SELECT n FROM t")
+//                 Err(_) => println("refused")
+//                 Ok(st) =>
+//                     match sqdriver.step(db, st).step
+//                         SqQueryRow(vs)    => println("a row")
+//                         SqQueryDone(n)    => println("${n} rows")
+//                         SqQueryFailed(f)  => println("failed")
+// ```
+pub fn step(db: SqDatabase, st: SqStatement) -> SqQueryAdvance [fs]
+    todo("sqlite-nv.sqdriver.step")
+
+// Put a statement back to the start, keeping its plan.
+//
+// The point of preparing once and running many times.
+pub fn reset(st: SqStatement) -> SqStatement
+    todo("sqlite-nv.sqdriver.reset")
+
+// Every row of a query, in one call.
+//
+// The convenience over `prepare` and `step`, and what most first uses
+// of this package will be.  It builds the whole answer in memory, so
+// a caller scanning a table larger than its memory uses the two
+// functions above instead — which is the reason both are public.
+//
+// ```novo
+// use sqdriver
+// use std.list
+//
+// fn main() [io, fs]
+//     match sqdriver.open_read_only("/tmp/app.db")
+//         Err(_) => println("no")
+//         Ok(db) =>
+//             match sqdriver.query(db, "SELECT n FROM t")
+//                 Ok(rows) => println("${list.len(rows)} rows")
+//                 Err(_)   => println("failed")
+// ```
+pub fn query(db: SqDatabase, sql: Str) -> Result<[[sqrec.SqValue]], sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqdriver.query")
+
+// One row, or `None` when the query produced none.
+pub fn query_row(db: SqDatabase, sql: Str) -> Result<?[sqrec.SqValue], sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqdriver.query_row")
+
+// Every row of one table, by name, with no SQL at all.
+//
+// The function a backup reader, a forensic tool and a migration
+// checker want, and the one that works even when the table's CREATE
+// statement uses something the parser does not yet accept: the rows
+// are in the b-tree whether or not the statement that made them
+// parses.
+pub fn table_rows(db: SqDatabase, table: Str) -> Result<[[sqrec.SqValue]], sqerror.SqFault> [fs]
+    todo("sqlite-nv.sqdriver.table_rows")
+
+// The tables a program can read, by name.
+//
+// Internal names — everything beginning `sqlite_` — are left out;
+// `sqschema.is_internal_name` is the predicate, and a caller that
+// wants them reads the catalogue directly.
+pub fn table_names(db: SqDatabase) -> [Str]
+    todo("sqlite-nv.sqdriver.table_names")
+
+// The definition of one table, or `None`.
+pub fn table_def(db: SqDatabase, name: Str) -> ?sqschema.SqTableDef
+    todo("sqlite-nv.sqdriver.table_def")

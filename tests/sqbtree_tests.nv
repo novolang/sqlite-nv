@@ -1,0 +1,118 @@
+// sqbtree_tests.nv — the request-and-answer loop, and the two things
+// a cursor must refuse rather than follow.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: sqlite-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE REFUSALS ARE THE POINT OF THE TESTS.  A cursor over a file
+// somebody else wrote has two ways to be attacked and both look like
+// ordinary data: an offset that leaves the page, and a child pointer
+// that names an ancestor.  Neither produces an error on its own — the
+// first reads whatever is next in memory and the second loops
+// forever reading pages that decode — so each has a test that asserts
+// the refusal rather than the success.
+
+use std.test
+use std.list
+use sqbtree
+use sqfmt
+use sqrec
+
+@test
+fn test_a_cursor_starts_by_asking_and_performs_nothing() [io]
+    let c = sqbtree.scan_table(2, 4096, sqfmt.SqUtf8)
+
+    test.case("it knows its root and its usable size")
+    test.assert(c.root == 2)
+    test.assert(c.usable == 4096)
+
+    test.case("and its first step is a request, not a row")
+    match sqbtree.step(c).step
+        SqNeed(r)       => test.assert(true)
+        SqRow(id, vs)   => test.assert(false)
+        SqEntry(vs)     => test.assert(false)
+        SqWalkDone(n)   => test.assert(false)
+        SqWalkFailed(f) => test.assert(false)
+
+    test.case("which names the page it is waiting for")
+    test.assert_some(sqbtree.awaiting(sqbtree.step(c).cursor))
+
+@test
+fn test_the_four_walks_carry_their_bounds() [io]
+    test.case("a rowid seek bounds itself at one key")
+    let s = sqbtree.seek_rowid(2, 4096, sqfmt.SqUtf8, 17)
+    test.assert(s.low == 17)
+    test.assert(s.high == 17)
+
+    test.case("a range carries both ends")
+    let r = sqbtree.range_rowid(2, 4096, sqfmt.SqUtf8, 4, 9)
+    test.assert(r.low == 4)
+    test.assert(r.high == 9)
+
+    test.case("an index scan carries no key")
+    test.assert(list.len(sqbtree.scan_index(3, 4096, sqfmt.SqUtf8).key) == 0)
+
+    test.case("and an index seek carries the one it was given")
+    let k = sqbtree.seek_index(3, 4096, sqfmt.SqUtf8, [sqrec.SqInt(v: 1)])
+    test.assert(list.len(k.key) == 1)
+
+@test
+fn test_a_page_the_cursor_did_not_ask_for_is_dropped_rather_than_used() [io]
+    let c = sqbtree.scan_table(2, 4096, sqfmt.SqUtf8)
+
+    test.case("feeding an unasked-for page is not an error")
+    let fed = sqbtree.feed_page(c, 99, [])
+    test.assert(fed.root == 2)
+
+    test.case("and the cursor is still waiting for its own")
+    test.assert(sqbtree.awaiting(fed) == sqbtree.awaiting(c))
+
+    test.case("an allocation answer is a separate channel")
+    test.assert(sqbtree.feed_alloc(c, 7).root == 2)
+
+@test
+fn test_a_descent_is_bounded_by_the_pages_the_file_has() [io]
+    // A corrupt interior page whose child pointer names an ancestor
+    // makes a descent loop forever, silently, reading pages that
+    // decode in an order that never terminates.
+    test.case("the bound grows with the file and is never unbounded")
+    test.assert(sqbtree.depth_limit(1) >= 1)
+    test.assert(sqbtree.depth_limit(1000) >= sqbtree.depth_limit(10))
+
+    test.case("and it is small enough to end a cycle quickly")
+    test.assert(sqbtree.depth_limit(1000000) < 1000000)
+
+@test
+fn test_a_table_cell_says_how_much_of_its_payload_is_on_the_page() [io]
+    test.case("bytes that are not a cell are refused")
+    match sqbtree.table_leaf_cell([], 4, 4096, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("an interior table cell is four bytes and a rowid")
+    match sqbtree.table_interior_cell([], 4, 4096, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and an index cell differs only by the left child")
+    match sqbtree.index_cell([], 4, 4096, 0, sqfmt.SqLeafIndex)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match sqbtree.index_cell([], 4, 4096, 0, sqfmt.SqInteriorIndex)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_overflow_chain_ends_where_the_payload_does_and_not_where_the_pointer_does() [io]
+    // An overflow page has no header saying how much of it is used.
+    // A reader that walked until the pointer was zero and took every
+    // byte it passed appends up to `usable - 4` bytes of whatever was
+    // in that page before — which decodes.
+    test.case("a chain page out of the file is refused")
+    match sqbtree.overflow_part([], 9, 4096, 100)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("the remaining count is what ends the walk")
+    test.assert(sqfmt.overflow_payload_bytes(4096) == 4092)

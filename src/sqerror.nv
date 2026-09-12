@@ -1,0 +1,159 @@
+// sqerror.nv — what a SQLite file can be wrong about, and what the
+// host can be wrong about while reading one.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ONE FAULT TYPE FOR A FORMAT AND A FILE, and the split inside it is
+// the one a caller acts on rather than the one a maintainer would
+// draw.  A database file arrives from somewhere else — a phone
+// backup, a browser profile, a firmware dump, an attachment — and the
+// only two questions its reader ever has to answer are "is this file
+// a SQLite database at all" and "did the part I just touched decode".
+// `SqNotADatabase` answers the first once, at open; every other
+// variant answers the second and names the PAGE, because a page
+// number is what a reader can act on: skip it, report it, or stop.
+//
+// A FAULT NAMES A PAGE AND AN OFFSET INSIDE IT, never a byte offset
+// in the file.  The two differ by the page size, which is in the
+// header the fault may be about — so a byte offset in a report about
+// a header that did not decode is arithmetic over a number nobody
+// trusts yet.
+//
+// THE CORRUPT AND THE UNSUPPORTED ARE DIFFERENT ANSWERS.  A file
+// SQLite itself would open and this package will not is
+// `SqUnsupported`, and the variant carries the feature's name so the
+// report reads as a gap in this port rather than as damage to the
+// user's data.  Everything that no SQLite would write is
+// `SqCorrupt`-shaped.  A reader that collapsed the two tells a user
+// their backup is broken when what happened is that it uses
+// auto-vacuum.
+
+// A fault reading, decoding or writing a SQLite database.
+pub enum SqFault
+    // The first sixteen bytes are not the SQLite magic string.  The
+    // only fault raised before anything about the file is believed,
+    // and the one a caller checks to decide "this is not a database"
+    // rather than "this database is damaged".
+    SqNotADatabase(got_prefix: [Int])
+    // The header decoded but a field in it is a value no SQLite
+    // writes: a page size that is not a power of two in 512..65536, a
+    // reserved region larger than the page, a text encoding outside
+    // 1..3, a schema format outside 1..4.
+    SqBadHeader(field: Str, value: Int)
+    // A page number outside `1..page_count`, or page 0, which does
+    // not exist.  The commonest shape a corrupt file takes, and the
+    // one a cursor must answer rather than follow.
+    SqNoSuchPage(page_no: Int, page_count: Int)
+    // The host was asked for a page and handed back fewer bytes than
+    // the page size.  A truncated file, or a read at the end of one.
+    SqShortPage(page_no: Int, got: Int, want: Int)
+    // Byte 0 of a b-tree page is not 2, 5, 10 or 13.
+    SqBadPageKind(page_no: Int, kind: Int)
+    // A cell pointer, a content-area start, a freeblock or an
+    // overflow pointer points outside the page's usable area.  The
+    // one check that makes reading a hostile file safe, so the
+    // variant carries both numbers rather than a message.
+    SqOffsetOutOfPage(page_no: Int, offset: Int, usable: Int)
+    // A varint ran past the end of what it was decoded from, or its
+    // ninth byte was reached with more to come.
+    SqBadVarint(page_no: Int, offset: Int)
+    // A record's header length disagreed with the serial types in it,
+    // or a serial type is 10 or 11 — the two codes SQLite reserves
+    // and no file uses.
+    SqBadRecord(page_no: Int, offset: Int, detail: Str)
+    // An overflow chain left the file, revisited a page, or ran out
+    // of pages before the payload was complete.  `visited` is how far
+    // it got, which is what separates a truncated chain from a loop.
+    SqBadOverflow(page_no: Int, visited: Int)
+    // A b-tree's descent went deeper than a tree over this many pages
+    // can be.  A loop in the child pointers, which is the shape a
+    // corrupt interior page takes, and the only defence against it is
+    // a depth bound.
+    SqTreeTooDeep(root: Int, depth: Int)
+    // The schema table held a row this package could not turn into a
+    // table definition: a missing column, a rootpage of 0 on a table,
+    // or CREATE TABLE text sql-engine-nv refused.
+    SqBadSchemaRow(name: Str, detail: Str)
+    // A WAL header's magic, format number or checksum did not hold,
+    // or its page size disagrees with the database's.
+    SqBadWal(field: Str, detail: Str)
+    // A WAL frame's checksum did not continue the running total.  Not
+    // corruption on its own — it is where the log ENDS, and
+    // `sqwal.ends_log` is the function that says so.
+    SqWalFrameChecksum(frame_no: Int)
+    // The file uses something this port does not read yet.  The name
+    // is the feature, in the words SQLite's own documentation uses,
+    // so the message reads as a gap here rather than as damage there.
+    SqUnsupported(feature: Str)
+    // The file could not be opened, read, locked or written.  The
+    // only variant raised by `[fs]` code.
+    SqIoFailed(operation: Str, path: Str)
+    // Another connection holds a conflicting lock.  Carries the
+    // holder's pid when the platform reports one and 0 when it does
+    // not, because "somebody else has it" and "who" are different
+    // amounts of help.
+    SqLocked(kind: Str, holder_pid: Int)
+    // A write was attempted on a database opened read-only, or on one
+    // whose header says it was written by a newer format.
+    SqReadOnly(path: Str, reason: Str)
+
+// One line naming what went wrong, for a report a person reads.
+//
+// Never a path and never a byte offset in the file: a fault is about
+// a page, and the path is the caller's — it opened the file.
+//
+// ```novo
+// use sqerror
+//
+// fn main() [io]
+//     println(sqerror.describe(sqerror.SqTreeTooDeep(root: 2, depth: 64)))
+// ```
+pub fn describe(f: SqFault) -> Str
+    todo("sqlite-nv.sqerror.describe")
+
+// True when `f` says the file is damaged rather than unsupported,
+// locked or unreadable.
+//
+// The predicate a backup tool branches on: a damaged file is one to
+// report, an unsupported one is one to open with something else, and
+// a locked one is one to retry.
+//
+// ```novo
+// use sqerror
+//
+// fn main() [io]
+//     println("${sqerror.is_corruption(sqerror.SqBadPageKind(page_no: 4, kind: 9))}")
+// ```
+pub fn is_corruption(f: SqFault) -> Bool
+    todo("sqlite-nv.sqerror.is_corruption")
+
+// The page a fault is about, or `None` for the faults that are about
+// the file rather than a page in it.
+//
+// ```novo
+// use sqerror
+//
+// fn main() [io]
+//     match sqerror.page_of(sqerror.SqShortPage(page_no: 7, got: 10, want: 4096))
+//         Some(p) => println("page ${p}")
+//         None    => println("no page")
+// ```
+pub fn page_of(f: SqFault) -> ?Int
+    todo("sqlite-nv.sqerror.page_of")
+
+// The feature name a `SqUnsupported` carries, or `None`.
+//
+// Published so a caller can collect what a corpus of files asks for
+// and turn it into the next implementation's order of work, which is
+// the use this package expects to be put to first.
+//
+// ```novo
+// use sqerror
+//
+// fn main() [io]
+//     match sqerror.unsupported_feature(sqerror.SqUnsupported(feature: "auto-vacuum"))
+//         Some(n) => println(n)
+//         None    => println("supported")
+// ```
+pub fn unsupported_feature(f: SqFault) -> ?Str
+    todo("sqlite-nv.sqerror.unsupported_feature")

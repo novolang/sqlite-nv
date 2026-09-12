@@ -1,0 +1,140 @@
+// sqschema_tests.nv — the schema table, the two properties of its SQL
+// text that change how rows are read, and the faults a file can carry.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: sqlite-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE TWO PROPERTIES ARE ASSERTED AS SPELLINGS, because SQLite's own
+// rules are narrower than they look and copying them loosely is how a
+// reader ends up dropping the rowid into a column that does hold
+// values.  `INT PRIMARY KEY` is not an alias; `INTEGER PRIMARY KEY`
+// is.
+
+use std.test
+use std.list
+use sqerror
+use sqschema
+
+@test
+fn test_the_schema_table_is_rooted_at_page_one_and_has_two_names() [io]
+    test.case("page 1, in every database that has ever existed")
+    test.assert(sqschema.schema_root() == 1)
+
+    test.case("and the modern name is the one it answers")
+    test.assert(sqschema.schema_name() == "sqlite_schema")
+
+@test
+fn test_a_schema_row_is_five_columns_and_is_refused_when_it_is_not() [io]
+    test.case("an empty record is not a schema row")
+    match sqschema.row_of_record([])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_two_constructors_keep_what_they_are_given() [io]
+    let c = sqschema.column_def("id", "INTEGER", true, "", "", true)
+
+    test.case("a column keeps its declared type as typed, not normalised")
+    test.assert(c.name == "id")
+    test.assert(c.declared_type == "INTEGER")
+    test.assert(c.not_null)
+    test.assert(c.is_rowid_alias)
+    test.assert(c.collation == "")
+
+    let t = sqschema.table_def("t", 2, [c], false, [0])
+
+    test.case("and a table keeps its root and its key")
+    test.assert(t.name == "t")
+    test.assert(t.root_page == 2)
+    test.assert(list.len(t.columns) == 1)
+    test.assert(t.without_rowid == false)
+    test.assert(list.len(t.primary_key) == 1)
+
+@test
+fn test_without_rowid_makes_a_table_an_index_btree() [io]
+    // A reader that walked a WITHOUT ROWID table with a table cursor
+    // decodes index cells as table cells and gets rowids out of
+    // payload lengths.
+    test.case("the clause is recognised at the end of the statement")
+    test.assert(sqschema.is_without_rowid("CREATE TABLE t(a PRIMARY KEY) WITHOUT ROWID"))
+
+    test.case("and an ordinary table does not carry it")
+    test.assert(sqschema.is_without_rowid("CREATE TABLE t(a)") == false)
+
+@test
+fn test_integer_primary_key_is_an_alias_and_int_primary_key_is_not() [io]
+    // The spelling is exact.  A column that IS the rowid holds NULL in
+    // every record, so a reader that handed the NULL back answers NULL
+    // for every primary key in the table.
+    let alias_col = sqschema.column_def("id", "INTEGER", false, "", "", true)
+    let plain_col = sqschema.column_def("id", "INT", false, "", "", false)
+
+    test.case("an INTEGER PRIMARY KEY column is the rowid")
+    match sqschema.rowid_alias(sqschema.table_def("t", 2, [alias_col], false, [0]))
+        None    => test.assert(false)
+        Some(i) => test.assert(i == 0)
+
+    test.case("an INT PRIMARY KEY column is an ordinary column")
+    test.assert_none(sqschema.rowid_alias(sqschema.table_def("t", 2, [plain_col], false, [0])))
+
+    test.case("and a table with no primary key has no alias")
+    test.assert_none(sqschema.rowid_alias(sqschema.table_def("t", 2, [], false, [])))
+
+@test
+fn test_the_catalogue_is_assembled_from_rows_and_looked_up_by_name() [io]
+    test.case("no rows means no tables and no indexes")
+    match sqschema.to_table_defs([])
+        Err(_) => test.assert(false)
+        Ok(ts) =>
+            test.assert(list.len(ts) == 0)
+            test.assert_none(sqschema.find_table(ts, "t"))
+
+            match sqschema.to_index_defs([], ts)
+                Err(_) => test.assert(false)
+                Ok(ix) =>
+                    test.assert(list.len(ix) == 0)
+                    test.assert(list.len(sqschema.indexes_on(ix, "t")) == 0)
+
+@test
+fn test_internal_names_and_non_binary_collations_are_asked_about() [io]
+    test.case("SQLite's own objects are named with a prefix")
+    test.assert(sqschema.is_internal_name("sqlite_autoindex_t_1"))
+    test.assert(sqschema.is_internal_name("t") == false)
+
+    test.case("a column declared COLLATE NOCASE is one a seek cannot trust")
+    let nocase = sqschema.column_def("a", "TEXT", false, "", "NOCASE", false)
+    test.assert(list.len(sqschema.non_binary_collations(
+        sqschema.table_def("t", 2, [nocase], false, []))) == 1)
+
+    test.case("and a column with no collation is BINARY, which is implemented")
+    let bin = sqschema.column_def("a", "TEXT", false, "", "", false)
+    test.assert(list.len(sqschema.non_binary_collations(
+        sqschema.table_def("t", 2, [bin], false, []))) == 0)
+
+@test
+fn test_a_fault_names_a_page_and_separates_damage_from_a_gap() [io]
+    // A backup tool branches on this: a damaged file is one to report,
+    // an unsupported one is one to open with something else, and a
+    // locked one is one to retry.
+    test.case("a corrupt page is corruption and names its page")
+    test.assert(sqerror.is_corruption(sqerror.SqShortPage(page_no: 7, got: 10, want: 4096)))
+    match sqerror.page_of(sqerror.SqShortPage(page_no: 7, got: 10, want: 4096))
+        None    => test.assert(false)
+        Some(p) => test.assert(p == 7)
+
+    test.case("an unsupported feature is not damage, and names itself")
+    test.assert(sqerror.is_corruption(sqerror.SqUnsupported(feature: "auto-vacuum")) == false)
+    match sqerror.unsupported_feature(sqerror.SqUnsupported(feature: "auto-vacuum"))
+        None    => test.assert(false)
+        Some(n) => test.assert(n == "auto-vacuum")
+
+    test.case("a lock is not damage either")
+    test.assert(sqerror.is_corruption(sqerror.SqLocked(kind: "reserved", holder_pid: 0)) == false)
+    test.assert_none(sqerror.unsupported_feature(sqerror.SqLocked(kind: "reserved", holder_pid: 0)))
+
+    test.case("a fault about the file names no page")
+    test.assert_none(sqerror.page_of(sqerror.SqNotADatabase(got_prefix: [])))
+
+    test.case("and every fault renders to something a person can read")
+    test.assert(sqerror.describe(sqerror.SqTreeTooDeep(root: 2, depth: 64)) != "")

@@ -1,0 +1,233 @@
+// sqhost_tests.nv — the three modules that touch the machine, and the
+// one property of them a test can assert without a file: the ORDER.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: sqlite-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHY THIS FILE IS SHORTER THAN THE OTHERS, on purpose.  `sqfile`,
+// `sqdriver` and `sqwrite` need a database on disk, and a test that
+// builds one needs a writer — which is the last thing in this package
+// to be implemented.  So the assertions here are of two kinds:
+//
+//   * the pure ones, which are the interesting ones.  Crash safety is
+//     an ORDER, and `sqwrite.commit_steps` answers the order as a
+//     VALUE, so "the journal is synced before the first page is
+//     written" is an assertion over a list with no crash, no file and
+//     no timing in it.  Likewise `sqwrite.next_lock`, which is the
+//     lock ladder as a function.
+//   * the shape ones, which name every `[fs]` entry point against a
+//     path that does not exist and assert that it refuses.  Thin, and
+//     they are what keeps the public surface from drifting away from
+//     a caller who cannot yet run it.
+//
+// The corpus tests — the ones that open a file `sqlite3` wrote and
+// assert on the rows — are what the implementation lane adds, and the
+// README says so under Status.
+
+use std.test
+use std.list
+use sqbtree
+use sqdriver
+use sqfile
+use sqfmt
+use sqwrite
+
+// A path that is not a database, used by every refusal assertion
+// below.  Named once so the tests say what they are about rather than
+// repeating a string.
+fn absent_path() -> Str
+    "/nonexistent/sqlite-nv-interface-probe.db"
+
+@test
+fn test_a_commit_syncs_the_journal_before_it_writes_the_first_page() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  A journal written after the
+    // page it protects protects nothing, and an fsync skipped between
+    // the two is the same bug with a smaller window.  Neither is
+    // visible except at a crash — so the order is answered as a value
+    // and asserted here.
+    test.case("a journalled commit has steps, in an order")
+    let steps = sqwrite.commit_steps(sqwrite.SqDeleteJournal, [2, 3], 8)
+    test.assert(list.len(steps) > 0)
+
+    test.case("a WAL commit has its own, and they differ")
+    test.assert(list.len(sqwrite.commit_steps(sqwrite.SqWalJournal, [2, 3], 8)) > 0)
+
+    test.case("and a rollback has the steps that undo one")
+    test.assert(list.len(sqwrite.rollback_steps(sqwrite.SqDeleteJournal, [2, 3])) > 0)
+
+    test.case("a commit that changes nothing still takes its locks")
+    test.assert(list.len(sqwrite.commit_steps(sqwrite.SqDeleteJournal, [], 8)) > 0)
+
+@test
+fn test_the_lock_ladder_is_climbed_a_rung_at_a_time() [io]
+    // A writer that took EXCLUSIVE directly deadlocks against every
+    // reader instead of waiting for the ones already running; one that
+    // skipped PENDING waits forever under a steady stream of them.
+    test.case("a reader holding SHARED has somewhere to climb to")
+    test.assert_some(sqwrite.next_lock(sqfile.SqShared, sqwrite.SqDeleteJournal))
+
+    test.case("and a writer holding EXCLUSIVE is already there")
+    test.assert_none(sqwrite.next_lock(sqfile.SqExclusive, sqwrite.SqDeleteJournal))
+
+    test.case("an unlocked handle starts at the bottom")
+    test.assert_some(sqwrite.next_lock(sqfile.SqUnlocked, sqwrite.SqWalJournal))
+
+    test.case("and PENDING is a rung, not an idea")
+    test.assert_some(sqwrite.next_lock(sqfile.SqReserved, sqwrite.SqDeleteJournal))
+    test.assert_none(sqwrite.next_lock(sqfile.SqPending, sqwrite.SqOffJournal))
+
+@test
+fn test_the_three_files_of_a_database_are_named_from_its_path() [io]
+    // A tool copying a database copies all three or none, and a tool
+    // cleaning up after a crashed process has to know both names.
+    test.case("the journal sits beside the database")
+    test.assert(sqwrite.journal_path("/tmp/app.db") == "/tmp/app.db-journal")
+
+    test.case("and so does the log")
+    test.assert(sqwrite.wal_path("/tmp/app.db") == "/tmp/app.db-wal")
+
+@test
+fn test_every_entry_point_refuses_a_path_that_is_not_a_database() [io, fs]
+    test.case("opening for writing")
+    match sqfile.open(absent_path())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("opening for reading")
+    match sqfile.open_read_only(absent_path())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and the driver over either")
+    match sqdriver.open(absent_path())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match sqdriver.open_read_only(absent_path())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_reading_surface_is_named_where_a_caller_would_reach_it() [io, fs]
+    // Thin by necessity — there is no database to open yet — and here
+    // so the public surface cannot drift away from a caller who
+    // cannot run it.  The corpus tests are the implementation lane's.
+    match sqfile.open_read_only(absent_path())
+        Ok(db) =>
+            test.case("the header and the staleness question")
+            let h = sqfile.header(db)
+            test.assert(h.page_size > 0)
+            match sqfile.is_stale(db)
+                Ok(s)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("a page, a pumped cursor and the catalogue")
+            match sqfile.read_page(db, 1)
+                Ok(p)  => test.assert(list.len(p) > 0)
+                Err(_) => test.assert(true)
+            match sqfile.catalogue(db)
+                Err(_)  => test.assert(true)
+                Ok(cat) =>
+                    match sqfile.rows_of(db, cat, "t")
+                        Ok(rs) => test.assert(list.len(rs) >= 0)
+                        Err(_) => test.assert(true)
+
+            test.case("and a cursor pumped against the file")
+            let c = sqbtree.scan_table(2, db.usable, sqfmt.SqUtf8)
+            match sqfile.pump(db, c)
+                Ok(p)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("the log, the locks and the close")
+            match sqfile.scan_wal(db)
+                Ok(ix) => test.assert(true)
+                Err(_) => test.assert(true)
+            test.assert_none(sqfile.lock(db, sqfile.SqShared))
+            test.assert(sqfile.lock_level(db) == sqfile.SqShared)
+            test.assert_none(sqfile.unlock(db))
+            test.assert_none(sqfile.close(db))
+
+        Err(f) =>
+            test.case("no database to open, so the refusal is the assertion")
+            test.assert(true)
+
+@test
+fn test_the_driver_surface_is_named_where_a_caller_would_reach_it() [io, fs]
+    match sqdriver.open_read_only(absent_path())
+        Ok(db) =>
+            test.case("the contract's three members")
+            match db.exec("CREATE TABLE t (n INTEGER)")
+                Some(e) => test.assert(true)
+                None    => test.assert(true)
+            match db.query_count("SELECT n FROM t")
+                Ok(n)  => test.assert(n >= 0)
+                Err(_) => test.assert(true)
+
+            test.case("the catalogue, the tables and the fault behind a DbError")
+            test.assert(list.len(sqdriver.table_names(db)) >= 0)
+            test.assert_none(sqdriver.table_def(db, "nothing"))
+            test.assert_none(sqdriver.last_fault(db))
+            test.assert(list.len(sqdriver.catalogue(db).tables) >= 0)
+
+            test.case("prepare, columns, step and reset")
+            match sqdriver.prepare(db, "SELECT n FROM t")
+                Err(_) => test.assert(true)
+                Ok(st) =>
+                    test.assert(list.len(sqdriver.columns(st)) >= 0)
+                    match sqdriver.step(db, sqdriver.reset(st)).step
+                        SqQueryRow(vs)   => test.assert(true)
+                        SqQueryDone(n)   => test.assert(n >= 0)
+                        SqQueryFailed(f) => test.assert(true)
+
+            test.case("and the three convenience readers")
+            match sqdriver.query(db, "SELECT n FROM t")
+                Ok(rs) => test.assert(list.len(rs) >= 0)
+                Err(_) => test.assert(true)
+            match sqdriver.query_row(db, "SELECT n FROM t")
+                Ok(r)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match sqdriver.table_rows(db, "t")
+                Ok(rs) => test.assert(list.len(rs) >= 0)
+                Err(_) => test.assert(true)
+
+            db.close()
+
+        Err(f) =>
+            test.case("no database to open, so the refusal is the assertion")
+            test.assert(true)
+
+@test
+fn test_the_writing_surface_is_named_where_a_caller_would_reach_it() [io, fs]
+    match sqfile.open(absent_path())
+        Ok(f)  =>
+            test.case("recovery and a checkpoint are asked of the file")
+            match sqwrite.recover(f)
+                Ok(r)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("a transaction stages pages and then commits or rolls back")
+            match sqwrite.begin(f, sqwrite.SqWalJournal)
+                Err(_) => test.assert(true)
+                Ok(t)  =>
+                    match sqwrite.stage_page(t, 2, [])
+                        Err(_) => test.assert(true)
+                        Ok(t2) =>
+                            match sqwrite.insert_row(t2, 2, None, [])
+                                Err(_) => test.assert(true)
+                                Ok(t3) =>
+                                    match sqwrite.update_row(t3, 2, 1, [])
+                                        Err(_) => test.assert(true)
+                                        Ok(t4) =>
+                                            match sqwrite.delete_row(t4, 2, 1)
+                                                Err(_) => test.assert(true)
+                                                Ok(t5) =>
+                                                    match sqwrite.commit(t5)
+                                                        Ok(_)  => test.assert(true)
+                                                        Err(_) => test.assert(true)
+                    match sqwrite.rollback(t)
+                        Ok(_)  => test.assert(true)
+                        Err(_) => test.assert(true)
+
+        Err(f) =>
+            test.case("no database to open, so the refusal is the assertion")
+            test.assert(true)

@@ -1,0 +1,190 @@
+// sqrec_tests.nv — the record format, and the three serial types that
+// occupy no bytes at all.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: sqlite-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE WIDTH TABLE IS ASSERTED ENTRY BY ENTRY, on purpose.  Serial
+// codes 1..6 mean 1, 2, 3, 4, 6 and 8 bytes — there is no 5 and no 7 —
+// and codes 0, 8 and 9 mean zero bytes because they carry their value
+// in the type.  A decoder that wrote `width = code` is right for four
+// of the nine and reads every column after a wrong one at the wrong
+// offset, which looks like corruption and is a table written as
+// arithmetic.
+
+use std.test
+use std.list
+use sqfmt
+use sqrec
+
+@test
+fn test_the_serial_width_table_has_no_five_and_no_seven() [io]
+    test.case("the six integer widths, in order")
+    test.assert(sqrec.serial_bytes(sqrec.SqSerInt(width: 1)) == 1)
+    test.assert(sqrec.serial_bytes(sqrec.SqSerInt(width: 2)) == 2)
+    test.assert(sqrec.serial_bytes(sqrec.SqSerInt(width: 3)) == 3)
+    test.assert(sqrec.serial_bytes(sqrec.SqSerInt(width: 4)) == 4)
+    test.assert(sqrec.serial_bytes(sqrec.SqSerInt(width: 6)) == 6)
+    test.assert(sqrec.serial_bytes(sqrec.SqSerInt(width: 8)) == 8)
+
+    test.case("code 5 is SIX bytes, not five")
+    match sqrec.serial_of(5, 4, 0)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(sqrec.serial_bytes(s) == 6)
+
+    test.case("code 6 is EIGHT bytes, not six")
+    match sqrec.serial_of(6, 4, 0)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(sqrec.serial_bytes(s) == 8)
+
+    test.case("a real is eight bytes")
+    test.assert(sqrec.serial_bytes(sqrec.SqSerReal) == 8)
+
+@test
+fn test_three_serial_types_occupy_no_bytes_at_all() [io]
+    // THE ASSERTION THIS FILE EXISTS FOR.  A column of booleans costs
+    // one header byte per row and nothing for the data; a decoder that
+    // gave codes 8 and 9 a width shifts every column after them.
+    test.case("null, zero and one carry their value in the type")
+    test.assert(sqrec.serial_bytes(sqrec.SqSerNull) == 0)
+    test.assert(sqrec.serial_bytes(sqrec.SqSerZero) == 0)
+    test.assert(sqrec.serial_bytes(sqrec.SqSerOne) == 0)
+
+    test.case("and their codes are 0, 8 and 9")
+    test.assert(sqrec.serial_code(sqrec.SqSerNull) == 0)
+    test.assert(sqrec.serial_code(sqrec.SqSerZero) == 8)
+    test.assert(sqrec.serial_code(sqrec.SqSerOne) == 9)
+
+    test.case("so a writer picks them for 0 and 1")
+    test.assert(sqrec.serial_code(sqrec.serial_for(sqrec.SqInt(v: 0))) == 8)
+    test.assert(sqrec.serial_code(sqrec.serial_for(sqrec.SqInt(v: 1))) == 9)
+    test.assert(sqrec.serial_code(sqrec.serial_for(sqrec.SqNull)) == 0)
+
+    test.case("and a wider integer gets the narrowest width that holds it")
+    test.assert(sqrec.serial_bytes(sqrec.serial_for(sqrec.SqInt(v: 200))) == 2)
+    test.assert(sqrec.serial_bytes(sqrec.serial_for(sqrec.SqReal(v: 1.5))) == 8)
+
+@test
+fn test_the_reserved_codes_are_refused_rather_than_guessed() [io]
+    // The two plausible guesses about 10 and 11 disagree about the
+    // value's LENGTH, so a decoder that guessed shifts every column
+    // after it rather than getting one value wrong.
+    test.case("code 10 is refused")
+    match sqrec.serial_of(10, 4, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("code 11 is refused")
+    match sqrec.serial_of(11, 4, 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and 12 is the first blob")
+    match sqrec.serial_of(12, 4, 0)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(sqrec.serial_bytes(s) == 0)
+
+    test.case("evens are blobs and odds are text, from 12 up")
+    match sqrec.serial_of(14, 4, 0)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(sqrec.serial_bytes(s) == 1)
+    match sqrec.serial_of(15, 4, 0)
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(sqrec.serial_bytes(s) == 1)
+
+    test.case("and the two lengths agree with the type's own field")
+    test.assert(sqrec.serial_bytes(sqrec.SqSerBlob(length: 7)) == 7)
+    test.assert(sqrec.serial_bytes(sqrec.SqSerText(length: 7)) == 7)
+
+@test
+fn test_a_record_round_trips_and_is_measured_before_it_is_built() [io]
+    let row = [sqrec.SqInt(v: 1), sqrec.SqText(v: "hello"), sqrec.SqNull]
+
+    test.case("the size is known without building the bytes")
+    test.assert(sqrec.encoded_size(row, sqfmt.SqUtf8) > 0)
+
+    test.case("and it is what the encoding produces")
+    match sqrec.encode_record(row, sqfmt.SqUtf8)
+        Err(_) => test.assert(false)
+        Ok(bs) =>
+            test.assert(list.len(bs) == sqrec.encoded_size(row, sqfmt.SqUtf8))
+
+            test.case("which decodes back to the same values")
+            match sqrec.decode_record(bs, 0, sqfmt.SqUtf8, 4)
+                Err(_) => test.assert(false)
+                Ok(r)  =>
+                    test.assert(list.len(r.values) == 3)
+                    test.assert(r.total_bytes == list.len(bs))
+                    test.assert(r.header_bytes > 0)
+                    test.assert(r.header_bytes < r.total_bytes)
+
+    test.case("bytes that are not a record are refused")
+    match sqrec.decode_record([], 0, sqfmt.SqUtf8, 4)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_header_and_one_column_can_be_read_without_the_rest() [io]
+    // Reading a row's rowid should not cost reading its thumbnail.
+    test.case("the header alone answers the types")
+    match sqrec.decode_header([], 0, 4)
+        Ok(ts) => test.assert(list.len(ts) >= 0)
+        Err(_) => test.assert(true)
+
+    test.case("one column is reachable by index")
+    match sqrec.column_at([], 0, 1, sqfmt.SqUtf8, 4)
+        Ok(v)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_record_shorter_than_its_table_is_not_damage() [io]
+    // `ALTER TABLE ADD COLUMN` does not rewrite stored rows: they keep
+    // the width they were written with, and the missing columns read
+    // as their defaults.  A decoder that refused a short record
+    // refuses every table anybody has added a column to.
+    let stored = [sqrec.SqInt(v: 1)]
+    let defaults = [sqrec.SqNull, sqrec.SqInt(v: 0), sqrec.SqText(v: "")]
+
+    test.case("padding takes the row up to the table's width")
+    test.assert(list.len(sqrec.pad_to(stored, 3, defaults)) == 3)
+
+    test.case("a row already the right width is unchanged")
+    test.assert(list.len(sqrec.pad_to(stored, 1, defaults)) == 1)
+
+@test
+fn test_values_report_their_class_and_do_not_coerce() [io]
+    test.case("the five names are SQLite's own")
+    test.assert(sqrec.type_name(sqrec.SqNull) == "null")
+    test.assert(sqrec.type_name(sqrec.SqInt(v: 1)) == "integer")
+    test.assert(sqrec.type_name(sqrec.SqReal(v: 1.0)) == "real")
+    test.assert(sqrec.type_name(sqrec.SqText(v: "a")) == "text")
+    test.assert(sqrec.type_name(sqrec.SqBlob(v: [])) == "blob")
+
+    test.case("an accessor answers its own class and nothing else")
+    test.assert_some(sqrec.as_int(sqrec.SqInt(v: 42)))
+    test.assert_none(sqrec.as_int(sqrec.SqText(v: "42")))
+    test.assert_some(sqrec.as_real(sqrec.SqReal(v: 1.0)))
+    test.assert_some(sqrec.as_text(sqrec.SqText(v: "a")))
+    test.assert_none(sqrec.as_text(sqrec.SqBlob(v: [])))
+    test.assert_some(sqrec.as_blob(sqrec.SqBlob(v: [])))
+
+    test.case("and a rendering is for a person, never for SQL")
+    test.assert(sqrec.show(sqrec.SqNull) != "")
+
+@test
+fn test_the_storage_class_order_is_the_order_an_index_is_built_in() [io]
+    // A seek into an index has to sort the way the file already did:
+    // NULL first, then numbers, then text, then blobs.
+    test.case("null sorts before everything")
+    test.assert(sqrec.compare(sqrec.SqNull, sqrec.SqInt(v: 0)) < 0)
+
+    test.case("numbers sort before text")
+    test.assert(sqrec.compare(sqrec.SqInt(v: 9999), sqrec.SqText(v: "")) < 0)
+
+    test.case("text sorts before blobs")
+    test.assert(sqrec.compare(sqrec.SqText(v: "zzz"), sqrec.SqBlob(v: [])) < 0)
+
+    test.case("and the comparison holds in both directions")
+    test.assert(sqrec.compare(sqrec.SqInt(v: 0), sqrec.SqNull) > 0)
+    test.assert(sqrec.compare(sqrec.SqInt(v: 1), sqrec.SqInt(v: 1)) == 0)

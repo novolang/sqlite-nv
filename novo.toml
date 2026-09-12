@@ -1,0 +1,78 @@
+[package]
+name        = "sqlite-nv"
+version     = "0.0.1"
+description = "The SQLite file format, read natively and with no libsqlite3: the 100-byte database header, the four b-tree page types and their cells, the record format with its serial types, the schema table, cursors that ask for a page instead of reading one, overflow chains, the write-ahead log and its checkpoint rule, and the std.sql driver over them.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and exactly two modules earn the layer: `sqfile` opens the
+# file, reads a page at an offset, takes the lock bytes and fsyncs,
+# and `sqdriver` and `sqwrite` sit on it.  Everything else — the
+# header, the page and cell layouts, the record format, the cursors,
+# the WAL frames, the schema table — is `[]` and is written so that
+# moving it to a `core` sibling would cost a manifest edit and nothing
+# else.  That is not a promise to move it: the format is ONE format,
+# and splitting the reader from the file it reads would leave a
+# consumer assembling two packages to open a database.  It is a
+# statement of where the boundary is, so a reader can see that the
+# arithmetic over an untrusted file is testable with no file in the
+# test — and `tests/sqfmt_tests.nv` and `tests/sqrec_tests.nv` are
+# that claim exercised.
+#
+# The other direction is the one worth stating: a `core` package may
+# not depend on this one, so nothing on the grid can acquire a file
+# handle by depending on a SQLite reader.
+layer       = "host"
+
+category    = "databases"
+
+tags        = ["sqlite", "file-format", "btree", "wal", "database", "driver", "sql", "native-port"]
+repository  = "https://github.com/novolang/sqlite-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The SQLite file format, and the page a cursor asks for"
+
+[dependencies]
+# NONE, and the absence is a blocked intention rather than a design.
+#
+# The design takes ONE dependency: `sql-engine-nv` for the query half
+# — SQL text in, a checked plan and an expression evaluator out —
+# while this package owns every byte on disk.  The line is not here
+# because it cannot be: `sql-engine-nv` 0.0.3 depends on `btree-nv`
+# 0.0.2, `btree-nv` ships a module named `cell`, `cell` is a
+# dispatching standard library module, and the build refuses every
+# consumer of an assembly carrying both.  Filed against btree-nv; the
+# fix is a rename and a republish in those two repositories, and the
+# release after it adds one line here.
+#
+# What that costs this interface: nothing in the public surface.  The
+# driver's prepared statement is `sqdriver.SqStatement` and its values
+# are `sqrec.SqValue`, both of them this package's own types, because
+# a driver that leaked the engine's `Statement` into its signatures
+# would make every consumer of a SQLite file take a SQL planner as
+# well.  So the engine is an IMPLEMENTATION dependency, and adding it
+# changes a manifest rather than a signature.
+#
+# What it costs the design: `sqschema.to_table_defs` answers this
+# package's own `SqTableDef` rather than the engine's `Schema`, and
+# `sqdriver.prepare` is the function whose body will hold the engine.
+# Both say so where they are declared.
+#
+# NOT btree-nv on its own either, and not only because of the module
+# name.  Its `PageRequest`, `Cursor` and `nodefmt` describe novo-lang's
+# OWN B+ tree — a 16-byte page header, `Int` keys, `cell.encode_row`
+# payloads — and a SQLite page has none of that.  Naming them here
+# would be a reader assuming a SQLite page decodes with them.
+# `sqbtree.SqPageRequest` is deliberately its own enum and the README
+# says why.

@@ -1,0 +1,277 @@
+// sqschema.nv — the one table every SQLite database has, and what a
+// reader has to get out of it before it can read anything else.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SCHEMA TABLE IS AN ORDINARY TABLE ROOTED AT PAGE 1, and it is
+// read by the same cursor as every other table.  That is the fact
+// that makes this module small: there is no special case for
+// bootstrapping, only the knowledge that the walk starts at page 1
+// and that its five columns mean something.
+//
+//   type      "table", "index", "view" or "trigger"
+//   name      the object's name
+//   tbl_name  the table it belongs to; for a table, itself
+//   rootpage  the b-tree's root page, and 0 for a view or a trigger
+//   sql       the CREATE statement as it was typed
+//
+// THE SCHEMA IS SQL TEXT AND NOT A STRUCTURE, which is the format's
+// own decision and this package's largest inherited cost.  Column
+// names, types, defaults, collations, the `WITHOUT ROWID` property
+// and the `INTEGER PRIMARY KEY` alias are all inside a string that
+// has to be parsed to be used.  sql-engine-nv's parser is what will
+// do that — see the manifest for why it is not a dependency yet — so
+// `to_table_defs` is declared over this package's own `SqTableDef`
+// and the engine's `Schema` is built from it one level up.
+//
+// TWO PROPERTIES OF THE TEXT CHANGE HOW ROWS ARE READ, and both are
+// separate functions because a reader that missed either answers
+// wrong rows rather than failing:
+//
+//   * `INTEGER PRIMARY KEY` (exactly that, in that spelling) makes a
+//     column an ALIAS for the rowid.  Its values are not in the
+//     record at all — the record holds a NULL in that position — and
+//     a reader that handed back the NULL answers NULL for every
+//     primary key in the table.  `rowid_alias` is the question.
+//   * `WITHOUT ROWID` makes the table an INDEX b-tree keyed by its
+//     primary key, not a table b-tree keyed by a rowid.  A reader
+//     that walked it with `scan_table` decodes index cells as table
+//     cells and gets rowids out of payload lengths.  `is_without_rowid`
+//     is the question, and `sqfile` asks it before it chooses a
+//     cursor.
+//
+// AN INTERNAL INDEX HAS NO SQL.  An index SQLite creates for a UNIQUE
+// or PRIMARY KEY constraint is named `sqlite_autoindex_<table>_<n>`
+// and its `sql` column is NULL, because there is no statement that
+// created it.  Its columns come from the table's constraint instead,
+// so a reader that required `sql` to be present drops exactly the
+// indexes a query would most like to use.
+
+use sqerror
+use sqrec
+
+// 1 — the page the schema table is rooted at, in every SQLite
+// database that has ever existed.
+pub fn schema_root() -> Int
+    todo("sqlite-nv.sqschema.schema_root")
+
+// "sqlite_schema" — the name, with the older `sqlite_master` accepted
+// as the alias it is.
+pub fn schema_name() -> Str
+    todo("sqlite-nv.sqschema.schema_name")
+
+// What kind of object a schema row describes.
+pub enum SqObjKind
+    SqObjTable
+    SqObjIndex
+    SqObjView
+    SqObjTrigger
+
+// One row of the schema table, as it is stored.
+pub struct SqSchemaRow
+    kind: SqObjKind
+    name: Str
+    // The table this belongs to; for a table, its own name.
+    table_name: Str
+    // The b-tree's root page; 0 for a view and for a trigger.
+    root_page: Int
+    // The CREATE statement as typed, or empty for an internal index —
+    // see the module comment.
+    sql: Str
+
+// One column of a table, as the CREATE statement declared it.
+pub struct SqColumnDef
+    name: Str
+    // The declared type, as typed and not normalised: "VARCHAR(20)",
+    // "INT", "" for a column declared with no type at all.  The
+    // affinity rules that turn it into one of five classes are the
+    // engine's, and re-deriving them here would be a second copy of a
+    // table that is already somewhere.
+    declared_type: Str
+    not_null: Bool
+    // The DEFAULT expression as typed, or empty.  Carried as text
+    // because a default may be an expression, and evaluating one
+    // needs the engine.
+    default_sql: Str
+    // The declared collation, or empty for BINARY.  `sqrec.compare`
+    // implements BINARY only, so a non-empty value here is a column
+    // whose index this reader cannot seek correctly, and `sqfile`
+    // says so rather than seeking it anyway.
+    collation: Str
+    // True when this column is the table's `INTEGER PRIMARY KEY` and
+    // therefore an alias for the rowid — see the module comment.
+    is_rowid_alias: Bool
+
+// A table, as the schema table describes it.
+pub struct SqTableDef
+    name: Str
+    root_page: Int
+    columns: [SqColumnDef]
+    // True when the table is `WITHOUT ROWID` and is therefore an
+    // index b-tree — see the module comment.
+    without_rowid: Bool
+    // The column positions making up the primary key, in key order.
+    // Empty when the table has none.
+    primary_key: [Int]
+
+// An index, as the schema table describes it.
+pub struct SqIndexDef
+    name: Str
+    table_name: Str
+    root_page: Int
+    // The indexed columns, by position in the table.
+    columns: [Int]
+    // Per column, true when the index stores it descending.
+    descending: [Bool]
+    unique: Bool
+    // True when SQLite created this index for a constraint and there
+    // is no CREATE statement for it — see the module comment.
+    internal: Bool
+    // The partial-index predicate as typed, or empty.  A partial
+    // index does not contain every row, so a reader that used one for
+    // a query the predicate does not cover answers a subset of the
+    // rows with no error.  Carried so the decision can be made; this
+    // package does not make it.
+    partial_sql: Str
+
+// ── reading the rows ─────────────────────────────────────────────────
+
+// Turn one record from the schema table into a row.
+//
+// Refuses a record with fewer than five columns, a `type` outside the
+// four, and a table with a root page of 0 — each of them a shape no
+// SQLite writes, and each of them one that would otherwise produce a
+// cursor rooted at a page that is not a b-tree.
+//
+// ```novo
+// use sqschema
+//
+// fn main() [io]
+//     match sqschema.row_of_record([])
+//         Ok(r)  => println(r.name)
+//         Err(_) => println("not a schema row")
+// ```
+pub fn row_of_record(values: [sqrec.SqValue]) -> Result<SqSchemaRow, sqerror.SqFault>
+    todo("sqlite-nv.sqschema.row_of_record")
+
+// The table definitions in a set of schema rows.
+//
+// Each one's `sql` is parsed; a statement that will not parse is
+// `SqBadSchemaRow` naming the object, because a database with one
+// unreadable table is still a database whose other tables can be
+// read, and a caller deserves to be told which one it lost.
+//
+// ```novo
+// use sqschema
+// use std.list
+//
+// fn main() [io]
+//     match sqschema.to_table_defs([])
+//         Ok(ts) => println("${list.len(ts)} tables")
+//         Err(_) => println("bad schema")
+// ```
+pub fn to_table_defs(rows: [SqSchemaRow]) -> Result<[SqTableDef], sqerror.SqFault>
+    todo("sqlite-nv.sqschema.to_table_defs")
+
+// The index definitions in a set of schema rows.
+//
+// `tables` is needed and not optional: an internal index has no SQL,
+// and its columns come from its table's constraint.
+pub fn to_index_defs(rows: [SqSchemaRow],
+                     tables: [SqTableDef]) -> Result<[SqIndexDef], sqerror.SqFault>
+    todo("sqlite-nv.sqschema.to_index_defs")
+
+// A table definition, assembled from its parts.
+//
+// A constructor rather than a struct literal at every call site,
+// because the field order of a five-field value is not something a
+// reader should have to remember and is not something this package
+// should be free to change under one.
+//
+// ```novo
+// use sqschema
+//
+// fn main() [io]
+//     println("${sqschema.table_def("t", 2, [], false, []).root_page}")
+// ```
+pub fn table_def(name: Str, root_page: Int, columns: [SqColumnDef], without_rowid: Bool,
+                 primary_key: [Int]) -> SqTableDef
+    todo("sqlite-nv.sqschema.table_def")
+
+// A column definition, assembled from its parts.
+//
+// ```novo
+// use sqschema
+//
+// fn main() [io]
+//     println(sqschema.column_def("a", "INTEGER", false, "", "", true).name)
+// ```
+pub fn column_def(name: Str, declared_type: Str, not_null: Bool, default_sql: Str, collation: Str,
+                  is_rowid_alias: Bool) -> SqColumnDef
+    todo("sqlite-nv.sqschema.column_def")
+
+// The table with this name, or `None`.
+pub fn find_table(tables: [SqTableDef], name: Str) -> ?SqTableDef
+    todo("sqlite-nv.sqschema.find_table")
+
+// The indexes on this table.
+pub fn indexes_on(indexes: [SqIndexDef], table_name: Str) -> [SqIndexDef]
+    todo("sqlite-nv.sqschema.indexes_on")
+
+// ── the two properties that change how rows are read ─────────────────
+
+// True when this CREATE TABLE statement ends `WITHOUT ROWID`.
+//
+// The table is then an INDEX b-tree keyed by its primary key, and
+// walking it with a table cursor decodes index cells as table cells —
+// see the module comment.
+//
+// ```novo
+// use sqschema
+//
+// fn main() [io]
+//     println("${sqschema.is_without_rowid("CREATE TABLE t(a) WITHOUT ROWID")}")
+// ```
+pub fn is_without_rowid(create_sql: Str) -> Bool
+    todo("sqlite-nv.sqschema.is_without_rowid")
+
+// The column that is this table's `INTEGER PRIMARY KEY`, by position,
+// or `None`.
+//
+// Its values are NOT in the record: the rowid is the value, and the
+// record holds a NULL in that position. A reader that handed back the
+// NULL answers NULL for every primary key in the table — see the
+// module comment.
+//
+// The spelling is exact.  `INT PRIMARY KEY` is not an alias and
+// neither is `INTEGER PRIMARY KEY DESC`; SQLite's own rule is
+// narrower than it looks and copying it loosely makes a reader that
+// drops the rowid into a column that does hold values.
+//
+// ```novo
+// use sqschema
+//
+// fn main() [io]
+//     match sqschema.rowid_alias(sqschema.table_def("t", 2, [], false, []))
+//         Some(i) => println("column ${i}")
+//         None    => println("no alias")
+// ```
+pub fn rowid_alias(t: SqTableDef) -> ?Int
+    todo("sqlite-nv.sqschema.rowid_alias")
+
+// True when this object's name is one SQLite reserves — it begins
+// `sqlite_`.
+//
+// A caller listing a user's tables filters on it; a caller reading
+// them all does not.
+pub fn is_internal_name(name: Str) -> Bool
+    todo("sqlite-nv.sqschema.is_internal_name")
+
+// The columns of `t` whose declared collation is not BINARY.
+//
+// `sqrec.compare` implements BINARY only. An index on one of these
+// columns is one this reader can walk but cannot SEEK correctly, so
+// the list exists to be checked before a seek rather than after a
+// wrong answer.
+pub fn non_binary_collations(t: SqTableDef) -> [Int]
+    todo("sqlite-nv.sqschema.non_binary_collations")

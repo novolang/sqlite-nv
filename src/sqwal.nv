@@ -1,0 +1,353 @@
+// sqwal.nv — the write-ahead log's own file, its frames, and the rule
+// that says when a frame may be copied back into the database.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE WAL IS A SECOND FILE AND A READER THAT IGNORES IT IS WRONG
+// RATHER THAN INCOMPLETE.  A database in WAL mode holds pages in
+// `<name>-wal` that the main file does not have yet, and a reader
+// that opened only the main file answers rows as they were at the
+// last checkpoint — which is not an error anywhere, just an old
+// answer.  So `sqfile.open` looks for the log, and every page read
+// goes through `frame_for` first.
+//
+// THE WAL HEADER — 32 bytes
+//
+//   0..3     magic: 0x377f0682 when the checksums are BIG-endian,
+//            0x377f0683 when they are little-endian.  The endianness
+//            of the CHECKSUM ONLY — every other field in the WAL is
+//            big-endian whichever magic is written
+//   4..7     file format, 3007000
+//   8..11    page size, which must equal the database's
+//   12..15   checkpoint sequence
+//   16..19   salt 1, incremented at every checkpoint restart
+//   20..23   salt 2, fresh random at every checkpoint restart
+//   24..27   checksum 1 over bytes 0..23
+//   28..31   checksum 2
+//
+// A FRAME HEADER — 24 bytes, then one page of content
+//
+//   0..3     the page number this frame holds
+//   4..7     the database size in pages after this frame, or 0 when
+//            the frame does not commit.  A NON-ZERO VALUE IS THE
+//            COMMIT RECORD; there is no separate one
+//   8..11    salt 1, copied from the WAL header
+//   12..15   salt 2, copied from the WAL header
+//   16..19   checksum 1, over the running total, this frame header's
+//            first eight bytes, and the page content
+//   20..23   checksum 2
+//
+// THE SALTS ARE THE DESIGN AND NOT BOOKKEEPING.  The log is written
+// in place and never truncated, so a frame whose salts do not match
+// the header's is a frame from BEFORE the last checkpoint — garbage
+// that a forward scan walks over and stops at.  That is what makes a
+// checkpoint O(1) at the end and recovery a scan that ends by itself.
+//
+// A BAD CHECKSUM IS THE END OF THE LOG, NOT CORRUPTION.  The last
+// frame of a log written by a process that was killed mid-write has a
+// checksum that does not continue the running total, because the
+// bytes after it are whatever was there before.  A recovery that
+// called that corruption would throw away every committed transaction
+// in the log.  `ends_log` is the function that separates the two, and
+// it exists so that treating a torn tail as damage cannot be written
+// by accident.
+//
+// THE CHECKSUM IS NOT A CRC.  It is two 32-bit words folded over the
+// input eight bytes at a time — s0 += x0 + s1, s1 += x1 + s0 — and
+// it is deliberately weak and fast.  Writing it as a CRC gives the
+// wrong answer on every frame; naming it `checksum` rather than `crc`
+// is the small defence against that.
+//
+// THE WAL-INDEX IS OUT OF SCOPE and the absence is deliberate.  The
+// `-shm` file is a shared-memory hash table over the frames, it is
+// not part of the file format's compatibility promise, and it is
+// rebuilt from the log by any process that finds it missing.  A
+// single-reader port builds `SqWalIndex` by scanning the log instead,
+// which costs one pass over a file that is usually a few megabytes
+// and buys not having to reproduce a structure whose layout may
+// change between SQLite releases.  A multi-process reader that needs
+// to share it is a later row and the README says so.
+
+use sqerror
+
+// The 32-byte WAL header, decoded.
+pub struct SqWalHeader
+    // True when the checksums in this file are big-endian, from which
+    // of the two magics is written.
+    big_endian_checksums: Bool
+    format: Int
+    page_size: Int
+    checkpoint_seq: Int
+    salt1: Int
+    salt2: Int
+    checksum1: Int
+    checksum2: Int
+
+// A 24-byte frame header, decoded.
+pub struct SqWalFrame
+    page_no: Int
+    // The database size in pages after this frame, or 0 when the
+    // frame does not commit a transaction.
+    db_size_after: Int
+    salt1: Int
+    salt2: Int
+    checksum1: Int
+    checksum2: Int
+
+// The two running words of the WAL checksum.
+pub struct SqChecksum
+    s0: Int
+    s1: Int
+
+// Which frame currently holds each page, and where the log ends.
+//
+// Built by scanning the log — see the module comment on the
+// wal-index. A page appearing in several frames resolves to the LAST
+// committed one, which is the whole point of the map.
+pub struct SqWalIndex
+    // The header the scan was made against; a different salt means
+    // this index is stale.
+    header: SqWalHeader
+    // Page numbers, and the frame number holding each.  Parallel
+    // lists rather than a map because this is an interface and a map
+    // type in a signature is a decision the implementation should get
+    // to make.
+    pages: [Int]
+    frames: [Int]
+    // How many frames the scan believed, which is the frame the last
+    // commit record sat on.  Frames after it exist in the file and
+    // are not part of the database.
+    committed_frames: Int
+    // The database size in pages as of that commit.
+    db_page_count: Int
+
+// How a checkpoint is allowed to behave.
+pub enum SqCheckpointMode
+    // Copy what can be copied without waiting for anybody, and stop.
+    SqPassive
+    // Wait for every writer, copy everything, leave the log in place.
+    SqFull
+    // As full, then also wait for readers and restart the log at
+    // frame one with fresh salts.
+    SqRestart
+    // As restart, then truncate the log file to nothing.
+    SqTruncate
+
+// ── the header ───────────────────────────────────────────────────────
+
+// 32 — the WAL header's size in bytes.
+pub fn header_size() -> Int
+    todo("sqlite-nv.sqwal.header_size")
+
+// 24 — a frame header's size in bytes.
+pub fn frame_header_size() -> Int
+    todo("sqlite-nv.sqwal.frame_header_size")
+
+// Decode the WAL header, checking its own two checksums.
+//
+// `db_page_size` is the database's, and a log that disagrees is
+// `SqBadWal("page_size", ...)` — the two files are one database and a
+// mismatch means the log belongs to a database that has been deleted
+// and recreated under the same name.
+//
+// ```novo
+// use sqwal
+//
+// fn main() [io]
+//     match sqwal.decode_header([], 4096)
+//         Ok(h)  => println("${h.checkpoint_seq}")
+//         Err(_) => println("not a wal")
+// ```
+pub fn decode_header(buf: [Int], db_page_size: Int) -> Result<SqWalHeader, sqerror.SqFault>
+    todo("sqlite-nv.sqwal.decode_header")
+
+// Encode a WAL header, computing its two checksums.
+pub fn encode_header(h: SqWalHeader) -> [Int]
+    todo("sqlite-nv.sqwal.encode_header")
+
+// A fresh WAL header for a log starting now.
+//
+// The salts are the CALLER's: this module has no clock and no
+// randomness, and a header that invented its own salt would be one
+// that could repeat after a crash — which is the one thing a salt may
+// not do.
+pub fn new_header(page_size: Int, checkpoint_seq: Int, salt1: Int, salt2: Int) -> SqWalHeader
+    todo("sqlite-nv.sqwal.new_header")
+
+// ── frames ───────────────────────────────────────────────────────────
+
+// The byte offset frame `n` starts at.  Frames are numbered from 1.
+//
+// ```novo
+// use sqwal
+//
+// fn main() [io]
+//     println("${sqwal.frame_offset(4096, 1)}")
+// ```
+pub fn frame_offset(page_size: Int, n: Int) -> Int
+    todo("sqlite-nv.sqwal.frame_offset")
+
+// How many frames a log of `file_bytes` bytes can hold.
+pub fn frame_capacity(page_size: Int, file_bytes: Int) -> Int
+    todo("sqlite-nv.sqwal.frame_capacity")
+
+// Decode a frame header and check its checksum against the running
+// total.
+//
+// `running` is the checksum after the previous frame, or
+// `checksum_seed(h)` before the first.  The answer carries the frame
+// and the new running total; a frame whose checksum does not hold is
+// `SqWalFrameChecksum`, which `ends_log` reads as the end rather than
+// as damage.
+pub struct SqFrameRead
+    frame: SqWalFrame
+    running: SqChecksum
+
+// Decode the frame at `buf`, with `page` its content.
+pub fn decode_frame(buf: [Int], page: [Int], h: SqWalHeader, frame_no: Int,
+                    running: SqChecksum) -> Result<SqFrameRead, sqerror.SqFault>
+    todo("sqlite-nv.sqwal.decode_frame")
+
+// Encode a frame header for `page`, continuing `running`.
+pub fn encode_frame(f: SqWalFrame, page: [Int], h: SqWalHeader, running: SqChecksum) -> [Int]
+    todo("sqlite-nv.sqwal.encode_frame")
+
+// The running checksum a log starts from: the header's own two words.
+pub fn checksum_seed(h: SqWalHeader) -> SqChecksum
+    todo("sqlite-nv.sqwal.checksum_seed")
+
+// Both words zero — what a header's own checksum is folded from, and
+// what a test starts a fold at.
+pub fn checksum_zero() -> SqChecksum
+    todo("sqlite-nv.sqwal.checksum_zero")
+
+// A frame header for a page, with the salts a header carries.
+//
+// A non-zero `db_size_after` makes it a commit; see `frame_commits`.
+//
+// ```novo
+// use sqwal
+//
+// fn main() [io]
+//     println("${sqwal.frame(7, 0, 1, 2).page_no}")
+// ```
+pub fn frame(page_no: Int, db_size_after: Int, salt1: Int, salt2: Int) -> SqWalFrame
+    todo("sqlite-nv.sqwal.frame")
+
+// Fold `bytes` into a running checksum.
+//
+// Two 32-bit words over eight bytes at a time, in the endianness the
+// header's magic chose. Not a CRC — see the module comment.
+//
+// ```novo
+// use sqwal
+//
+// fn main() [io]
+//     let c = sqwal.checksum(sqwal.checksum_zero(), [], true)
+//     println("${c.s0}")
+// ```
+pub fn checksum(running: SqChecksum, bytes: [Int], big_endian: Bool) -> SqChecksum
+    todo("sqlite-nv.sqwal.checksum")
+
+// True when this frame's salts match the header's — i.e. when it
+// belongs to the current log rather than to one before a checkpoint.
+//
+// ```novo
+// use sqwal
+//
+// fn main() [io]
+//     let f = sqwal.frame(1, 0, 1, 2)
+//     println("${sqwal.frame_is_current(f, sqwal.new_header(4096, 0, 1, 2))}")
+// ```
+pub fn frame_is_current(f: SqWalFrame, h: SqWalHeader) -> Bool
+    todo("sqlite-nv.sqwal.frame_is_current")
+
+// True when this frame commits a transaction — when its
+// `db_size_after` is non-zero. There is no separate commit record.
+pub fn frame_commits(f: SqWalFrame) -> Bool
+    todo("sqlite-nv.sqwal.frame_commits")
+
+// ── recovery ─────────────────────────────────────────────────────────
+
+// True when `f` is a fault that ENDS the log rather than condemning
+// it: a checksum that did not continue, or salts from before the last
+// checkpoint.
+//
+// The function the module comment exists for.  A recovery that
+// treated a torn tail as corruption throws away every committed
+// transaction in the log, and a recovery that treated real corruption
+// as a torn tail keeps reading a file that is lying to it. This is
+// the line between them, and it has a name so neither can be written
+// by accident.
+//
+// ```novo
+// use sqwal
+// use sqerror
+//
+// fn main() [io]
+//     println("${sqwal.ends_log(sqerror.SqWalFrameChecksum(frame_no: 12))}")
+// ```
+pub fn ends_log(f: sqerror.SqFault) -> Bool
+    todo("sqlite-nv.sqwal.ends_log")
+
+// The frame currently holding `page_no`, or `None` when the log does
+// not have that page and the database file does.
+//
+// Every page read in WAL mode goes through this first.
+//
+// ```novo
+// use sqwal
+//
+// fn main() [io]
+//     let ix = sqwal.index_new(sqwal.new_header(4096, 0, 1, 2))
+//     match sqwal.frame_for(ix, 3)
+//         Some(n) => println("frame ${n}")
+//         None    => println("not in the log")
+// ```
+pub fn frame_for(ix: SqWalIndex, page_no: Int) -> ?Int
+    todo("sqlite-nv.sqwal.frame_for")
+
+// An empty index over this header — what a scan starts from.
+pub fn index_new(h: SqWalHeader) -> SqWalIndex
+    todo("sqlite-nv.sqwal.index_new")
+
+// Record one frame in the index, in scan order.
+//
+// A later frame for a page replaces an earlier one, and a frame after
+// the last commit is recorded but not counted — `committed_frames`
+// only moves on a frame that commits.
+pub fn index_add(ix: SqWalIndex, frame_no: Int, f: SqWalFrame) -> SqWalIndex
+    todo("sqlite-nv.sqwal.index_add")
+
+// ── the checkpoint rule ──────────────────────────────────────────────
+
+// How many frames of `ix` a checkpoint may copy back, given the
+// oldest snapshot any reader still holds.
+//
+// THE ONE RULE A CHECKPOINT CAN GET WRONG: a frame may be copied into
+// the database file only when no reader is still reading the version
+// of that page the file currently holds. `oldest_reader_frame` is the
+// smallest frame number any open reader is reading at, or the
+// committed count when there are none, and a checkpoint that copied
+// past it changes a page under a reader that is mid-query — which
+// does not fail, it answers a row from two transactions at once.
+//
+// Answering a NUMBER rather than performing the copy is what makes
+// the policy testable with no file: a test builds an index, names a
+// reader, and asserts on how far a checkpoint would get.
+//
+// ```novo
+// use sqwal
+//
+// fn main() [io]
+//     let ix = sqwal.index_new(sqwal.new_header(4096, 0, 1, 2))
+//     println("${sqwal.checkpoint_limit(ix, 0, sqwal.SqPassive)}")
+// ```
+pub fn checkpoint_limit(ix: SqWalIndex, oldest_reader_frame: Int, mode: SqCheckpointMode) -> Int
+    todo("sqlite-nv.sqwal.checkpoint_limit")
+
+// True when this mode may restart the log at frame one with fresh
+// salts — `SqRestart` and `SqTruncate`, and only when the checkpoint
+// copied every frame.
+pub fn may_restart(mode: SqCheckpointMode, copied: Int, ix: SqWalIndex) -> Bool
+    todo("sqlite-nv.sqwal.may_restart")
