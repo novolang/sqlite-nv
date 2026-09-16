@@ -1,6 +1,6 @@
 [package]
 name        = "sqlite-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The SQLite file format, read natively and with no libsqlite3: the 100-byte database header, the four b-tree page types and their cells, the record format with its serial types, the schema table, cursors that ask for a page instead of reading one, overflow chains, the write-ahead log and its checkpoint rule, and the std.sql driver over them.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
