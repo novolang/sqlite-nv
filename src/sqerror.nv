@@ -97,6 +97,21 @@ pub enum SqFault
     // whose header says it was written by a newer format.
     SqReadOnly(path: Str, reason: Str)
 
+// `SqFault` is an `Error`, which is what lets `Result<T, SqFault>`
+// exist at all — the header and cell arithmetic in `sqfmt`, the
+// records in `sqrec`, the cursors in `sqbtree`, the schema table in
+// `sqschema`, the log in `sqwal`, the file in `sqfile`, the
+// transactions in `sqwrite` and the std.sql driver in `sqdriver` all
+// answer with one.
+impl Error for SqFault
+    // The one-line message: `sqerror.describe`'s sentence, naming the
+    // page and the offset inside it — never a path and never a byte
+    // offset in the file, for the reason the module comment gives.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("sqlite-nv.SqFault.message")
+
 // One line naming what went wrong, for a report a person reads.
 //
 // Never a path and never a byte offset in the file: a fault is about
